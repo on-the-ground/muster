@@ -1,0 +1,4 @@
+/bin/
+/.muster/
+*.test
+coverage.out
