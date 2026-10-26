@@ -1,0 +1,19 @@
+name: Test
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check formatting
+        run: test -z "$(gofmt -l cmd internal)"
+      - run: go mod download
+      - run: go mod verify
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+      - run: go build -o bin/muster ./cmd/muster
