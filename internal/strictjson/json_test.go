@@ -28,3 +28,25 @@ func TestRejectAmbiguousAndMalformedJSON(t *testing.T) {
 		})
 	}
 }
+
+func TestConfigurationTagsAreExactButGeneralKeysAreCaseSensitive(t *testing.T) {
+	var target struct {
+		Version int `json:"version"`
+	}
+	for _, raw := range []string{`{"VERSION":1}`, `{"version":1,"Version":2}`} {
+		if err := Unmarshal([]byte(raw), &target); err == nil {
+			t.Fatal("inexact struct field accepted")
+		}
+	}
+	m, err := Object([]byte(`{"a":1,"A":2}`))
+	if err != nil || len(m) != 2 {
+		t.Fatal("ordinary JSON keys changed semantics")
+	}
+	fields, err := Fields([]byte(`{"structured_output": {"n": 1.2300e+40},"is_error":false}`))
+	if err != nil || string(fields["structured_output"]) != `{"n": 1.2300e+40}` {
+		t.Fatal("raw output extraction changed number spelling")
+	}
+	if _, err := Fields([]byte(`{"structured_output":{"n":1,"n":2}}`)); err == nil {
+		t.Fatal("nested duplicate accepted by envelope extraction")
+	}
+}

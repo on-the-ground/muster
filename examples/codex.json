@@ -69,6 +69,7 @@
       },
       "binding": {
         "backend": "codex",
+        "experimental": true,
         "extraction": "codex-output-file",
         "context": [
           {
@@ -82,7 +83,7 @@
         "effect": "read-only",
         "cancellation": "terminate-process-group",
         "reuseSession": false,
-        "resources": "live-workspace",
+        "resources": "host-filesystem-readable",
         "timeoutSeconds": 120
       }
     }

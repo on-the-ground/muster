@@ -1,51 +1,95 @@
 # Validation record — 2026-10-26
 
-This is current-instance evidence for the initial issue #1 implementation,
-not approval of a final registration schema or a claim of real-worker readiness.
+This is current-instance evidence for issue #1 and the PR #2 review corrections,
+not approval of a final registration schema or a claim that both real-worker
+backends are ready.
 
-## Verified
+## Verified in this cloud instance
 
-- Go 1.25.14 on Linux; official MCP Go SDK v1.8.0 and jsonschema-go v0.4.3.
-- `go test -race -count=1 -json ./...`: **49 passed, 1 skipped** (including
-  subtests). The skipped test is the explicitly opt-in real-worker test.
+- Go 1.25.14 on Linux; MCP Go SDK v1.8.0 and jsonschema-go v0.4.3.
+- `go test -race -count=1 -json ./...`: **64 passed, 1 skipped**, including
+  subtests. The skipped test is the explicitly opt-in real-worker test.
 - `go vet ./...`, `go mod verify`, and `go build -o bin/muster ./cmd/muster`.
-- Both example manifests load and pass native CLI capability checks with
-  Claude Code 2.1.310 and Codex CLI 0.163.0. Authentication is not part of `-check`.
-- Raw MCP stdio and an unmodified official generic SDK client exercise
-  registration/list/call through separate fixture processes for both bindings.
-- Exact large integer and decimal/exponent tokens, duplicate JSON keys, invalid
-  inputs, invalid outputs, backend crashes, timeouts, cancellation, disconnection,
-  fresh sessions, fail-closed evidence writes, no redispatch and private stderr.
-- A Linux cancellation test observes that a spawned descendant also terminates
-  with the native process group. Fixture isolation-flag checks are separate from
-  any claim about real model tool enforcement.
+- Cross-build for `GOOS=darwin GOARCH=arm64`; macOS runtime execution was not
+  available here. Linux uses non-reaping `waitid(WNOWAIT)`; macOS uses `NOTE_EXIT`.
+- Both example manifests pass native CLI capability/version checks with Claude
+  Code 2.1.310 and Codex CLI 0.163.0. A probe checks actual option declarations,
+  records a resolved executable path/version, and does not establish model auth
+  or behavioral permission enforcement.
+- Generic SDK client and raw MCP stdio tests cover registration/list/call,
+  separate fixture processes, exact numeric tokens, invalid inputs/results,
+  crashes, deadlines, cancellation, disconnection and blank-line handling.
+- Configuration aliases such as `VERSION` and `Executable` are rejected before
+  Go struct decoding. General JSON object keys remain case-sensitive, preserving
+  valid tool arguments such as distinct `a` and `A` keys.
+- Parent Claude/Codex session selectors and an unrelated secret marker are
+  absent in the actual fixture child environment. Explicit operator variable
+  names are forwarded, forced memory controls cannot be weakened by the parent,
+  and fresh fixture sessions differ. Real-native testing now makes two calls
+  and asserts that both IDs differ from each other and the parent IDs.
+- Backend specifications participate in the contract hash; evidence records
+  CLI kind, resolved path and version. Oversized Claude schema arguments are
+  refused before launch. Input errors identify the schema field without raw
+  values. Journal write/short-write failures latch the journal closed and
+  prevent future dispatch.
+- Process tests exercise normal-exit descendant cleanup, cancellation of a
+  process group, an escaped child holding pipes, and immutable completion facts
+  after later cancellation. `ErrWaitDelay` is distinguished as
+  `failureKind:worker_io_timeout`; uncertainty returns no successful Value.
+  Group absence is required for `workerTerminated:true`. On this instance an
+  unreaped orphan zombie can keep a group observable; parent exit alone then
+  produces uncertainty instead of a false termination claim.
 
-The fixtures exercise the native CLI protocols; they are deterministic test
-programs, **not actual Claude or Codex model executions**.
+The fixtures are deterministic subprocesses, **not actual model workers**. Their
+flag checks do not prove native model tool or filesystem permission enforcement.
 
-## Real worker: blocked, not passed
+## Claude authentication and memory corrections
 
-The opt-in test was separately attempted with the registered `research-brief`
-tool and existing Codex ChatGPT login. `tools/list` and `tools/call` reached the
-actual separate CLI worker. It did not produce a result within the manifest's
-120-second deadline. Evidence recorded `timeout`, `cancelRequested:true` and
-`workerTerminated:true`. No successful structured result is claimed.
+The owner selected removal of `--bare` in the
+[review](https://github.com/on-the-ground/muster/pull/2#pullrequestreview-5647506094).
+The reviewer reported that Claude Code 2.1.310 passed the real registration →
+list → call → worker → schema-valid cited result flow on the reviewed baseline
+with only `--bare` removed. This is reviewer-reported local evidence, not a
+cloud rerun or verification of distinct sessions after the new corrections.
 
-A shorter direct CLI diagnosis using the same read-only controls observed
-`thread.started`, model connection retries/errors and HTTP 403 responses with
-`chatgpt.com` as the destination. The running environment's allowed destinations
-did not include that host. The environment draft now preserves the existing
-`storage.googleapis.com` rule and adds **`chatgpt.com`**. Draft saving alone
-does not apply the policy or publish the environment. Review/save the network
-setting before retrying the opt-in test documented in the README.
+The current adapter uses `--safe-mode` instead: its native help explicitly
+states that CLAUDE.md/customizations are disabled while auth works normally.
+It retains empty settings sources, disabled hooks, strict empty MCP config,
+disabled skills and no session persistence. It also forces
+`CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` and `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` in the
+filtered worker environment. It no longer forces API-only authentication.
 
-Claude native authentication reports no login, and no Anthropic credential
-binding was present. The selected `--bare` profile needs a supported API/provider
-credential through the worker's normal secure setup; do not place it in a
-manifest, prompt, evidence file or chat. A real Claude result and actual native
-permission-denial scenarios remain unverified.
+A real 2.1.310 startup probe used an isolated `CLAUDE_CONFIG_DIR` containing a
+synthetic user `CLAUDE.md` canary, the production isolation controls and no
+credentials. The initialization trace reported `project memory is off`, safe
+mode disabling installed plugin hooks and Claude.ai MCP, and did not echo the
+canary. This verifies startup controls and observed initialization behavior;
+it is not a model-level canary/non-disclosure proof. `--setting-sources ""`
+alone is not used as the memory-isolation guarantee. No actual user's memory or
+credential files were modified or copied, and raw debug logs are not committed.
 
-The optional Subsea policy adapter, Vessel #67 integration, live web research,
-worker pools and remote publication were not run or implemented. Issue #1's
-real-worker completion evidence therefore remains outstanding; the offline
-MVP and its local lifecycle tests are reviewable independently.
+The updated native Claude smoke test was attempted in this cloud. Its first
+call returned `execution_failed`; native auth status remained `loggedIn:false`.
+Evidence recorded Claude 2.1.310, parent exit and confirmed group termination,
+without cancellation. Therefore the two-real-session assertion and actual model
+memory-denial scenario remain unverified here. Run the opt-in test in an already
+authenticated native environment; credentials do not belong in manifests/chat.
+
+## Codex remains experimental
+
+The earlier Codex native attempt reached the real CLI but timed out at 120
+seconds. Direct diagnosis observed model connection retries and HTTP 403s with
+`chatgpt.com` as destination; no successful structured result was claimed.
+The environment draft includes a `chatgpt.com` addition, which alone does not
+prove the policy was applied or the endpoint is authorized.
+
+Until real native denial scenarios are observed, the Codex manifest must specify
+`binding.experimental:true` and `execution.resources:"host-filesystem-readable"`.
+Its MCP catalog description exposes that scope. The OS user may read files
+elsewhere on the host, including credential files; a temporary cwd is not a
+restricted read boundary. Shell/apply-patch feature keys are requested, not
+behaviorally proven. Stronger guarantees require native denial evidence and/or
+external filesystem isolation. This follows the review's explicit experimental
+alternative rather than describing fixture flags as native enforcement proof.
+
+The optional Subsea adapter and Vessel #67 integration remain separate work.

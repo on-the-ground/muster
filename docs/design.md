@@ -40,7 +40,9 @@ before SDK decoding so duplicate keys cannot be lost to map decoding.
 The MVP admits one active job; overlap is rejected with `busy`, with no queued
 work. It records `job-created`, `worker-started`, then `job-finished`. Rejected
 inputs have a terminal-only record. The journal is serialized and synced before
-worker dispatch; failure to record evidence prevents dispatch or success.
+worker dispatch; failure to record evidence prevents dispatch or success. A
+short write, I/O or sync failure latches the journal closed: subsequent records
+cannot be appended to a potentially damaged JSONL stream.
 
 | Status | Meaning |
 | --- | --- |
@@ -50,7 +52,7 @@ worker dispatch; failure to record evidence prevents dispatch or success.
 | `output_contract_violation` | Missing/extraction-invalid output, duplicate keys, invalid JSON or result schema mismatch. |
 | `timeout` | Job deadline elapsed; local exit is recorded separately. |
 | `cancelled` | Caller/shutdown cancellation, with termination facts recorded separately. |
-| `effect_uncertain` | A worker was started but its local termination was not observed. |
+| `effect_uncertain` | Parent exit or full process-group termination could not be confirmed, or output pipes outlived the parent. `failureKind:worker_io_timeout` distinguishes an `ErrWaitDelay`. |
 | `evidence_failure` | Required evidence could not be persisted; no successful result is returned. |
 | `busy`, `shutting_down` | Dispatch refused before worker execution. |
 
@@ -61,14 +63,22 @@ fallback backend, or automatic retry, even for a read-only task. A caller retry
 is a new job, not deduplicated: request IDs are protocol correlation, not effect
 idempotency keys.
 
-Cancellation kills the native process group and waits for the CLI. `CancelRequested`
-and `WorkerTerminated` are separate facts. Descendants that intentionally escape
+Cancellation requests process-group termination. Normal and failed exits also
+clean up the group. Linux `waitid(WNOWAIT)` and macOS `NOTE_EXIT` observe exit
+without reaping; the group is signalled while its leader still reserves the
+PID/PGID. Cancellation is disabled once exit is settled, before `Cmd.Wait`
+reaps it, preventing later signals to a recycled group ID. The proxy uses this
+settled cancellation reason instead of re-reading a possibly later context
+deadline. `parentExited`, `cancelRequested` and `workerTerminated` are separate
+facts. Only observed group absence plus parent exit establishes termination; a
+remaining zombie group is conservatively uncertain. `ErrWaitDelay` is recorded
+separately and never turned into success. Descendants that intentionally escape
 the process group and remote model activity are outside that guarantee. Control
 plane billing/authentication/cache activity may already have happened. Neither
 termination nor a read-only declaration is a rollback guarantee.
 
 The evidence record binds tool/contract/instruction versions and hashes, local
-job, backend/native session, request/arguments/result digests, context source
+job, backend kind/resolved executable/version/native session, request/arguments/result digests, context source
 digests and capture times, execution times, local exit, cancellation and effect
 status. Raw credential-bearing streams are never included in errors or JSONL.
 The worker's source citations remain in the schema-defined MCP result; the
@@ -85,13 +95,16 @@ output and call arguments never select a command, arbitrary CLI flags, tool
 registration, permissions or session reuse. No task instruction is accepted as
 a substitute for a native permission control.
 
-Claude's no-tools profile refuses filesystem/network tool tasks. Codex's
-read-only sandbox denies model shell writes, while approvals and live web
-search are disabled; this does not pin the host filesystem. Process-wide OS
-isolation, resource quotas and a narrower read scope require deployment controls
-outside this MVP and are not claimed by its manifest. Context captured from
-files is copied once and immutable in memory; its observed time/hash do not
-establish that all external resources were frozen for the worker's lifetime.
+Claude's no-tools profile uses safe mode and explicit memory controls while
+retaining native authentication. Backend-specific environment allowlists prevent
+inheriting parent sessions and unrelated credentials; operator-selected provider
+bindings remain explicit. Codex is experimental and declares the host
+filesystem readable. A read-only sandbox does not confine reads to its temporary
+cwd; the shell/apply-patch feature settings have not been behaviorally verified.
+Actual denial evidence is required before stronger claims can replace this
+explicit scope. Process-wide isolation, resource quotas and a narrower read
+scope require deployment controls outside this MVP. Captured context remains
+immutable, but its observation time/hash does not freeze other host resources.
 
 The core neither advertises nor interprets Subsea Host policy metadata. It never
 turns job progress into `/N`, inherits Scheduler policy, adopts Runtime outcomes

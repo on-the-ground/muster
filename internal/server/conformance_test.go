@@ -41,10 +41,10 @@ func manifest(t *testing.T, worker, kind string) (string, string) {
 	evidence := filepath.Join(dir, "evidence.jsonl")
 	permissions, extraction, resources := "no-tools", "claude-structured-output", "captured-context"
 	if kind == "codex" {
-		permissions, extraction, resources = "read-only-sandbox", "codex-output-file", "live-workspace"
+		permissions, extraction, resources = "read-only-sandbox", "codex-output-file", "host-filesystem-readable"
 	}
 	text := "Return arguments unchanged as one JSON object."
-	m := contract.Manifest{Version: 1, Backends: map[string]contract.Backend{"worker": {Kind: kind, Executable: worker}}, Tools: []contract.Tool{{Name: "echo", Description: "Echo exact JSON numbers.", Version: "1", InputSchema: json.RawMessage(fixtureSchema), OutputSchema: json.RawMessage(fixtureSchema), Instructions: contract.Instructions{Version: "1", Text: text, SHA256: contract.Hash([]byte(text))}, Binding: contract.Binding{Backend: "worker", Extraction: extraction, Context: []contract.ContextFile{}}, Execution: contract.Execution{Permissions: permissions, Effect: "read-only", Cancellation: "terminate-process-group", Resources: resources, TimeoutSeconds: 1}}}}
+	m := contract.Manifest{Version: 1, Backends: map[string]contract.Backend{"worker": {Kind: kind, Executable: worker}}, Tools: []contract.Tool{{Name: "echo", Description: "Echo exact JSON numbers.", Version: "1", InputSchema: json.RawMessage(fixtureSchema), OutputSchema: json.RawMessage(fixtureSchema), Instructions: contract.Instructions{Version: "1", Text: text, SHA256: contract.Hash([]byte(text))}, Binding: contract.Binding{Backend: "worker", Experimental: kind == "codex", Extraction: extraction, Context: []contract.ContextFile{}}, Execution: contract.Execution{Permissions: permissions, Effect: "read-only", Cancellation: "terminate-process-group", Resources: resources, TimeoutSeconds: 1}}}}
 	b, _ := json.Marshal(m)
 	if err := os.WriteFile(path, b, 0600); err != nil {
 		t.Fatal(err)
@@ -139,6 +139,9 @@ func TestStdioConformanceBothBackends(t *testing.T) {
 			c := start(t, server, path, evidence)
 			c.send(t, `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
 			list := c.receive(t)
+			if kind == "codex" && (!bytes.Contains(list, []byte("Experimental")) || !bytes.Contains(list, []byte("host filesystem readable"))) {
+				t.Fatal("experimental read scope was not exposed to MCP clients")
+			}
 			if !bytes.Contains(list, []byte(`"name":"echo"`)) || !bytes.Contains(list, []byte(`"outputSchema"`)) {
 				t.Fatalf("catalog missing: %s", list)
 			}
@@ -179,6 +182,9 @@ func TestStdioConformanceBothBackends(t *testing.T) {
 					t.Fatal(err)
 				}
 				e := r.Result.Meta["muster/evidence"]
+				if e.BackendKind != kind || e.BackendVersion != "fixture-cli 1.0.0" || !filepath.IsAbs(e.BackendPath) {
+					t.Fatal("missing backend identity in execution evidence")
+				}
 				if e.Status != tc.want || r.Result.IsError != (tc.want != "succeeded") {
 					t.Fatalf("%s: %s", tc.want, response)
 				}
@@ -204,6 +210,9 @@ func TestStdioConformanceBothBackends(t *testing.T) {
 }
 
 type proxyEvidence struct {
+	BackendKind      string `json:"backendKind"`
+	BackendVersion   string `json:"backendVersion"`
+	BackendPath      string `json:"backendPath"`
 	Status           string `json:"status"`
 	WorkerTerminated bool   `json:"workerTerminated"`
 	CancelRequested  bool   `json:"cancelRequested"`
@@ -290,6 +299,23 @@ func TestGuardRejectsDuplicateKeysBeforeSDK(t *testing.T) {
 	got, err := io.ReadAll(r)
 	if err != nil || string(got) != raw {
 		t.Fatal("wire changed")
+	}
+}
+
+func TestBlankLinesDoNotDisconnectOrCancelCalls(t *testing.T) {
+	server, worker := binaries(t)
+	path, evidence := manifest(t, worker, "claude")
+	c := start(t, server, path, evidence)
+	c.send(t, "\n \t\n")
+	c.send(t, `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"echo","arguments":{"n":1,"mode":"ok"}}}`+"\n\n \t")
+	result := c.receive(t)
+	if !bytes.Contains(result, []byte(`"status":"succeeded"`)) {
+		t.Fatalf("blank lines broke call: %s", result)
+	}
+	c.send(t, "\n")
+	c.send(t, `{"jsonrpc":"2.0","id":6,"method":"tools/list","params":{}}`)
+	if !bytes.Contains(c.receive(t), []byte(`"name":"echo"`)) {
+		t.Fatal("connection was not retained")
 	}
 }
 

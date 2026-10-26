@@ -12,3 +12,4 @@ func supportedPlatform() error {
 }
 func configureProcess(cmd *exec.Cmd) {}
 func killGroup(cmd *exec.Cmd) error  { return cmd.Process.Kill() }
+func groupAbsent(cmd *exec.Cmd) bool { return false }

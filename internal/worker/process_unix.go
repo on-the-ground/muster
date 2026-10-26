@@ -8,7 +8,7 @@ import (
 	"syscall"
 )
 
-func supportedPlatform() error       { return nil }
+func supportedPlatform() error       { return exitObservationSupported() }
 func configureProcess(cmd *exec.Cmd) { cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} }
 func killGroup(cmd *exec.Cmd) error {
 	err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
@@ -16,4 +16,8 @@ func killGroup(cmd *exec.Cmd) error {
 		return nil
 	}
 	return err
+}
+
+func groupAbsent(cmd *exec.Cmd) bool {
+	return errors.Is(syscall.Kill(-cmd.Process.Pid, 0), syscall.ESRCH)
 }

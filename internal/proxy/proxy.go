@@ -36,6 +36,9 @@ type Evidence struct {
 	InstructionVersion string            `json:"instructionVersion"`
 	InstructionHash    string            `json:"instructionHash"`
 	Backend            string            `json:"backend"`
+	BackendKind        string            `json:"backendKind,omitempty"`
+	BackendPath        string            `json:"backendPath,omitempty"`
+	BackendVersion     string            `json:"backendVersion,omitempty"`
 	SessionID          string            `json:"sessionId,omitempty"`
 	RequestHash        string            `json:"requestHash,omitempty"`
 	ArgumentsHash      string            `json:"argumentsHash"`
@@ -47,19 +50,30 @@ type Evidence struct {
 	WorkerStarted      bool              `json:"workerStarted"`
 	CancelRequested    bool              `json:"cancelRequested"`
 	WorkerTerminated   bool              `json:"workerTerminated"`
+	ParentExited       bool              `json:"parentExited"`
+	FailureKind        string            `json:"failureKind,omitempty"`
 	Status             string            `json:"status"`
 	Effect             string            `json:"effect"`
 }
 
 type Journal struct {
-	mu  sync.Mutex
-	out io.Writer
+	mu      sync.Mutex
+	out     io.Writer
+	failure error
 }
 
 func NewJournal(out io.Writer) *Journal { return &Journal{out: out} }
-func (j *Journal) Append(e Evidence) error {
+func (j *Journal) Append(e Evidence) (err error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if j.failure != nil {
+		return j.failure
+	}
+	defer func() {
+		if err != nil {
+			j.failure = err
+		}
+	}()
 	b, err := json.Marshal(e)
 	if err != nil {
 		return err
@@ -82,6 +96,7 @@ type Result struct {
 	Output   json.RawMessage
 	Evidence Evidence
 	Error    string
+	Message  string
 }
 
 type Proxy struct {
@@ -138,6 +153,11 @@ func (p *Proxy) Call(ctx context.Context, name string, args json.RawMessage) Res
 	}
 	id := newID()
 	e := Evidence{Version: 1, Event: "job-created", JobID: id, Tool: name, ToolVersion: t.Definition.Version, ContractHash: t.ContractHash, InstructionVersion: t.Definition.Instructions.Version, InstructionHash: t.Definition.Instructions.SHA256, Backend: t.Definition.Binding.Backend, ArgumentsHash: contract.Hash(args), Context: []ContextEvidence{}, Resources: t.Definition.Execution.Resources, StartedAt: time.Now().UTC(), Status: "accepted", Effect: "not-started"}
+	if b, ok := p.backends[t.Definition.Binding.Backend].(interface{ Identity() worker.Identity }); ok {
+		identity := b.Identity()
+		e.BackendKind, e.BackendPath, e.BackendVersion = identity.Kind, identity.Path, identity.Version
+	}
+	var detail string
 	for _, c := range t.Context {
 		e.Context = append(e.Context, ContextEvidence{c.Name, c.SHA256, c.ObservedAt})
 	}
@@ -151,19 +171,29 @@ func (p *Proxy) Call(ctx context.Context, name string, args json.RawMessage) Res
 			code = "evidence_failure"
 			output = nil
 			e.Status = code
+			detail = ""
 		}
 		if code == "succeeded" {
 			return Result{Output: output, Evidence: e}
 		}
-		return Result{Evidence: e, Error: code}
+		return Result{Evidence: e, Error: code, Message: detail}
 	}
 	// A terminal-only record is sufficient for requests rejected before dispatch.
 	input, err := strictjson.Object(args)
-	if err != nil || t.Input.Validate(input) != nil {
+	if err != nil {
+		detail = "arguments must be one JSON object with unique keys"
+		return finish("invalid_input", nil)
+	}
+	if err := t.Input.Validate(input); err != nil {
+		detail = err.Error()
+		if len(detail) > 200 {
+			detail = detail[:200] + "..."
+		}
 		return finish("invalid_input", nil)
 	}
 	prompt, err := Assemble(t, args)
 	if err != nil {
+		detail = "assembled request exceeds the size limit"
 		return finish("invalid_input", nil)
 	}
 	e.RequestHash = contract.Hash(prompt)
@@ -185,15 +215,20 @@ func (p *Proxy) Call(ctx context.Context, name string, args json.RawMessage) Res
 	p.mu.Unlock()
 	defer func() { p.mu.Lock(); delete(p.active, id); p.mu.Unlock(); p.wg.Done() }()
 	if err := p.journal.Append(e); err != nil {
-		return Result{Error: "evidence_failure", Evidence: e}
+		return finish("evidence_failure", nil)
 	}
 	if err := jobctx.Err(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return finish("timeout", nil)
+		}
 		return finish("cancelled", nil)
 	}
 	proc, err := p.backends[t.Definition.Binding.Backend].Start(jobctx, worker.Request{Prompt: prompt, Schema: t.Definition.OutputSchema})
 	if err != nil {
 		if jobctx.Err() != nil {
-			e.CancelRequested = true
+			if errors.Is(jobctx.Err(), context.DeadlineExceeded) {
+				return finish("timeout", nil)
+			}
 			return finish("cancelled", nil)
 		}
 		return finish("execution_failed", nil)
@@ -208,15 +243,19 @@ func (p *Proxy) Call(ctx context.Context, name string, args json.RawMessage) Res
 	}
 	out, waitErr := proc.Wait()
 	e.WorkerStarted, e.WorkerTerminated, e.CancelRequested, e.SessionID = out.Started, out.Terminated, out.CancelRequested, out.SessionID
+	e.ParentExited = out.ParentExited
+	if errors.Is(waitErr, worker.ErrWaitDelay) {
+		e.FailureKind = "worker_io_timeout"
+	}
 	e.Effect = "read-only-no-rollback-claim"
 	if !out.Terminated {
 		e.Effect = "uncertain"
 		return finish("effect_uncertain", nil)
 	}
-	if errors.Is(jobctx.Err(), context.DeadlineExceeded) {
+	if out.CancelReason == "timeout" {
 		return finish("timeout", nil)
 	}
-	if errors.Is(jobctx.Err(), context.Canceled) || out.CancelRequested {
+	if out.CancelRequested {
 		return finish("cancelled", nil)
 	}
 	if errors.Is(waitErr, worker.ErrOutput) {

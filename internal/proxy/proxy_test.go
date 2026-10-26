@@ -16,25 +16,83 @@ import (
 const schema = `{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"],"additionalProperties":false}`
 
 type fakeBackend struct {
-	calls  atomic.Int32
-	output json.RawMessage
-	err    error
+	calls        atomic.Int32
+	output       json.RawMessage
+	err          error
+	beforeReturn func()
+	uncertain    bool
 }
 
 func (b *fakeBackend) Check(context.Context) error { return nil }
 func (b *fakeBackend) Start(_ context.Context, r worker.Request) (worker.Process, error) {
 	b.calls.Add(1)
-	return &fakeProcess{out: b.output, err: b.err}, nil
+	return &fakeProcess{out: b.output, err: b.err, beforeReturn: b.beforeReturn, uncertain: b.uncertain}, nil
 }
 
 type fakeProcess struct {
-	out json.RawMessage
-	err error
+	out          json.RawMessage
+	err          error
+	beforeReturn func()
+	uncertain    bool
 }
 
 func (p *fakeProcess) Cancel() error { return nil }
 func (p *fakeProcess) Wait() (worker.Outcome, error) {
-	return worker.Outcome{Output: p.out, Started: true, Terminated: true, SessionID: "test-session"}, p.err
+	if p.beforeReturn != nil {
+		p.beforeReturn()
+	}
+	return worker.Outcome{Output: p.out, Started: true, ParentExited: true, Terminated: !p.uncertain, SessionID: "test-session"}, p.err
+}
+
+type shortWriter struct{ calls int }
+
+func (w *shortWriter) Write(b []byte) (int, error) { w.calls++; return len(b) - 1, nil }
+func TestJournalLatchesFailureAndPreventsFutureDispatch(t *testing.T) {
+	w := &shortWriter{}
+	j := NewJournal(w)
+	if j.Append(Evidence{}) == nil || j.Append(Evidence{}) == nil || w.calls != 1 {
+		t.Fatal("journal appended after a damaged record")
+	}
+	b := &fakeBackend{}
+	p, _ := New(catalog(t), map[string]worker.Backend{"test": b}, j)
+	defer p.Close()
+	if r := p.Call(context.Background(), "echo", json.RawMessage(`{"n":1}`)); r.Error != "evidence_failure" || b.calls.Load() != 0 {
+		t.Fatal("dispatch continued with a failed journal")
+	}
+}
+
+func TestObservedCompletionWinsOverLateContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b := &fakeBackend{output: json.RawMessage(`{"n":1}`), beforeReturn: cancel}
+	var log bytes.Buffer
+	p, _ := New(catalog(t), map[string]worker.Backend{"test": b}, NewJournal(&log))
+	defer p.Close()
+	if r := p.Call(ctx, "echo", json.RawMessage(`{"n":1}`)); r.Error != "" {
+		t.Fatalf("late context cancellation changed observed completion: %s", r.Error)
+	}
+}
+
+func TestUncertainTerminationAndPipeDelayAreDistinctEvidence(t *testing.T) {
+	b := &fakeBackend{uncertain: true, err: worker.ErrWaitDelay}
+	var log bytes.Buffer
+	p, _ := New(catalog(t), map[string]worker.Backend{"test": b}, NewJournal(&log))
+	defer p.Close()
+	r := p.Call(context.Background(), "echo", json.RawMessage(`{"n":1}`))
+	if r.Error != "effect_uncertain" || r.Evidence.WorkerTerminated || !r.Evidence.ParentExited || r.Evidence.FailureKind != "worker_io_timeout" || len(r.Output) > 0 {
+		t.Fatalf("uncertain termination concealed: %+v", r)
+	}
+}
+
+func TestInvalidInputExplainsFieldWithoutEchoingRawValue(t *testing.T) {
+	b := &fakeBackend{}
+	var log bytes.Buffer
+	p, _ := New(catalog(t), map[string]worker.Backend{"test": b}, NewJournal(&log))
+	defer p.Close()
+	r := p.Call(context.Background(), "echo", json.RawMessage(`{"n":"PRIVATE_VALUE"}`))
+	if r.Error != "invalid_input" || !strings.Contains(r.Message, `["n"]`) || !strings.Contains(r.Message, "number") || strings.Contains(r.Message, "PRIVATE_VALUE") {
+		t.Fatalf("unhelpful or unsafe input error: %+v", r)
+	}
 }
 
 func catalog(t *testing.T) *contract.Catalog {

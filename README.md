@@ -14,7 +14,7 @@ another general agent framework.
 
 ## Build and test
 
-Requires Go **1.25.14**, a Unix OS, and the selected native CLI on PATH.
+Requires Go **1.25.14**, Linux or macOS, and the selected native CLI on PATH.
 The default tests use separate deterministic fixture processes and require no
 model account or API requests. The fixture is not an agent.
 
@@ -26,13 +26,13 @@ go vet ./...
 go test -race -count=1 ./...
 ```
 
-An opt-in real-worker test makes one model request (normal account charges may
+An opt-in real-worker test makes two model requests (normal account charges may
 apply). It runs `research-brief` through a generic SDK client and checks source
-citations and native session correlation:
+citations, two distinct native sessions and separation from parent session IDs:
 
 ```sh
 mkdir -p .muster
-MUSTER_NATIVE_MANIFEST="$PWD/examples/codex.json" \
+MUSTER_NATIVE_MANIFEST="$PWD/examples/claude.json" \
 MUSTER_NATIVE_EVIDENCE="$PWD/.muster/native.jsonl" \
 go test ./internal/server -run '^TestNativeWorker$' -count=1 -v
 ```
@@ -43,12 +43,16 @@ conformance does not imply real-worker or credential readiness.
 The Claude adapter requires the flags provided by Claude Code 2.1.310; the Codex
 adapter requires those provided by Codex CLI 0.163.0, notably
 `exec --ignore-user-config --ignore-rules --ephemeral`. Startup probes the actual
-CLI help and refuses missing flags. It does not silently fall back to weaker
+CLI help using option-declaration boundaries, records the CLI version, and refuses missing flags. It does not silently fall back to weaker
 execution settings. A capability check does not validate model authentication.
 Use an existing authenticated native CLI; muster never collects keys or logs in.
-Claude runs in `--bare` mode, which requires `ANTHROPIC_API_KEY` or supported
-provider authentication; it intentionally does not read a Claude OAuth/keychain
-login. Codex retains its native authentication while ignoring user configuration.
+Claude uses `--safe-mode`, which preserves native OAuth/subscription and API
+authentication while disabling user customizations. It also disables memory
+discovery explicitly. Codex retains native authentication while ignoring user
+configuration. Workers receive a backend-specific environment allowlist, never
+the complete proxy environment; parent session identifiers are always excluded.
+Additional provider variable names can be registered by the operator through
+`backends.<id>.environmentAllowlist` (names only, never secret values).
 
 ## Run a registered research tool
 
@@ -61,7 +65,7 @@ whenever its exact UTF-8 text changes.
 mkdir -p .muster
 bin/muster -manifest examples/claude.json -check
 bin/muster -manifest examples/claude.json -evidence .muster/jobs.jsonl
-# Or choose the second adapter:
+# Experimental second adapter; the host filesystem remains readable:
 bin/muster -manifest examples/codex.json -evidence .muster/jobs.jsonl
 ```
 
@@ -80,6 +84,8 @@ Use one server process per client connection. Stdout is MCP messages only.
 Success includes the schema-valid object in `structuredContent`, identical JSON
 in text content, and `_meta["muster/evidence"]`. Failures set `isError:true`
 and provide a stable failure code without returning a success-shaped object.
+Input errors also identify the schema field and expected type without echoing
+its raw value.
 
 ## Contract and execution limits
 
@@ -93,16 +99,23 @@ and provide a stable failure code without returning a success-shaped object.
   [the manifest contract](docs/manifest.md) for the exact boundary and rationale.
 - Arguments, schemas and results preserve JSON number tokens. Duplicate keys at
   any depth are rejected, including escaped spellings of the same key. Malformed
-  JSON-RPC frames terminate the transport before dispatch. There is no output
+  JSON-RPC frames terminate the transport before dispatch; blank lines are skipped.
+  Configuration keys must match their JSON tags exactly. There is no output
   repair or automatic redispatch.
 - Claude currently supports **no model tools**: builtin tools and MCP servers
-  are disabled by CLI flags. Bare mode also disables inherited hooks, plugins,
-  memory and CLAUDE.md discovery. Only captured context is provided. This is not an
-  OS sandbox around the Claude CLI itself. Codex uses its native read-only
-  execution sandbox, with approvals disabled, fresh temporary cwd, user config
-  and rules ignored, web search and shell/apply-patch features disabled. Its host
-  filesystem is not a pinned snapshot. Neither adapter supports effectful tasks
-  or operator-specified arbitrary flags in this MVP.
+  are disabled by CLI flags. `--safe-mode`, empty settings sources, disabled
+  hooks/skills and forced memory controls exclude inherited CLAUDE.md and auto
+  memory while retaining native authentication. Admin-managed policy still
+  applies. This is not an OS sandbox around the Claude CLI itself.
+- **Codex is experimental.** The manifest must opt in with
+  `binding.experimental:true` and `execution.resources:"host-filesystem-readable"`.
+  Its catalog description warns clients about this scope. A temporary cwd does
+  not restrict reading other files accessible to the worker's OS user, including
+  credential files. The adapter requests the native read-only sandbox, no
+  approvals, disabled search and shell/apply-patch feature settings, but native
+  denial scenarios and those feature keys remain behaviorally unverified. It
+  does not advertise a confined read scope or a proven no-tools guarantee.
+  Neither adapter accepts effectful tasks or arbitrary per-call CLI flags.
 - Native CLI control-plane activity (model requests, authentication, caches,
   billing) is separate from the declared read-only **task** effect. The operator
   is responsible for account, filesystem and network isolation around the CLI.
@@ -112,9 +125,14 @@ and provide a stable failure code without returning a success-shaped object.
   or worker pool is implemented. Each job has a finite timeout. Cancellation,
   disconnection and shutdown stop/reap the worker process group on a best-effort
   basis; a cancellation request and observed local exit are distinct evidence.
-  Remote work may outlive local termination. Clients own retry decisions.
+  Cleanup also runs on normal exit, before the reserved group leader is reaped.
+  `parentExited` and confirmed process-group absence are separate facts; a
+  lingering group or output pipe produces uncertainty. Remote work may outlive
+  local termination. Clients own retry decisions.
 - Evidence is private JSONL, mode 0600, containing versions, hashes, job/backend/
-  session correlation, context capture times, status and cancellation/exit facts.
+  session correlation, resolved executable path/version, context capture times,
+  status and cancellation/exit facts. A journal write or sync failure latches
+  the journal closed; subsequent calls cannot dispatch workers.
   Prompts, raw worker streams, credentials, input/result bodies and environment
   values are excluded. Results and sources are available in the MCP response;
   local evidence keeps their hashes. See [design](docs/design.md).

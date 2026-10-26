@@ -112,3 +112,67 @@ func TestExactIntegerExponentClassification(t *testing.T) {
 		}
 	}
 }
+
+func TestManifestRejectsCaseAliasesAndOversizedSchema(t *testing.T) {
+	m := validManifest()
+	b, _ := json.Marshal(m)
+	for _, body := range []string{
+		strings.Replace(string(b), `"version":1`, `"version":1,"VERSION":2`, 1),
+		strings.Replace(string(b), `"executable":"claude"`, `"executable":"claude","Executable":"/tmp/untrusted"`, 1),
+	} {
+		p := filepath.Join(t.TempDir(), "manifest.json")
+		_ = os.WriteFile(p, []byte(body), 0600)
+		if _, err := Load(p); err == nil {
+			t.Fatal("case-insensitive configuration alias accepted")
+		}
+	}
+	m = validManifest()
+	m.Tools[0].OutputSchema = json.RawMessage(strings.Replace(testSchema, `"type":"object"`, `"description":"`+strings.Repeat("x", MaxClaudeSchemaBytes)+`","type":"object"`, 1))
+	if _, err := loadManifest(t, m); err == nil {
+		t.Fatal("oversized Claude schema registered")
+	}
+	m = validManifest()
+	m.Backends["worker"] = Backend{Kind: "claude", Executable: "claude", EnvironmentAllowlist: []string{"CLAUDE_CODE_SESSION_ID"}}
+	if _, err := loadManifest(t, m); err == nil {
+		t.Fatal("parent session binding registered")
+	}
+}
+
+func TestBackendIdentityParticipatesInContractHash(t *testing.T) {
+	m := validManifest()
+	a, err := loadManifest(t, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := m.Backends["worker"]
+	b.Executable = "/opt/other/claude"
+	m.Backends["worker"] = b
+	c, err := loadManifest(t, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Tools[0].ContractHash == c.Tools[0].ContractHash {
+		t.Fatal("backend executable change did not change contract hash")
+	}
+}
+
+func TestCodexRequiresExplicitExperimentalHostReadScope(t *testing.T) {
+	m := validManifest()
+	m.Backends["worker"] = Backend{Kind: "codex", Executable: "codex"}
+	m.Tools[0].Binding.Experimental = true
+	m.Tools[0].Binding.Extraction = "codex-output-file"
+	m.Tools[0].Execution.Permissions = "read-only-sandbox"
+	m.Tools[0].Execution.Resources = "host-filesystem-readable"
+	if _, err := loadManifest(t, m); err != nil {
+		t.Fatal(err)
+	}
+	m.Tools[0].Binding.Experimental = false
+	if _, err := loadManifest(t, m); err == nil {
+		t.Fatal("non-experimental Codex contract accepted")
+	}
+	m.Tools[0].Binding.Experimental = true
+	m.Tools[0].Execution.Resources = "live-workspace"
+	if _, err := loadManifest(t, m); err == nil {
+		t.Fatal("ambiguous Codex read scope accepted")
+	}
+}

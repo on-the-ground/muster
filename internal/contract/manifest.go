@@ -26,8 +26,9 @@ type Manifest struct {
 // Executable is operator configuration, never caller-controlled. No arbitrary
 // per-call flags, environment variables or session identifiers are accepted.
 type Backend struct {
-	Kind       string `json:"kind"`
-	Executable string `json:"executable"`
+	Kind                 string   `json:"kind"`
+	Executable           string   `json:"executable"`
+	EnvironmentAllowlist []string `json:"environmentAllowlist,omitempty"`
 }
 
 type Instructions struct {
@@ -37,9 +38,10 @@ type Instructions struct {
 }
 
 type Binding struct {
-	Backend    string        `json:"backend"`
-	Extraction string        `json:"extraction"`
-	Context    []ContextFile `json:"context"`
+	Backend      string        `json:"backend"`
+	Experimental bool          `json:"experimental,omitempty"`
+	Extraction   string        `json:"extraction"`
+	Context      []ContextFile `json:"context"`
 }
 
 type ContextFile struct {
@@ -90,6 +92,19 @@ func Hash(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[
 
 var namePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
 
+// Keep a single Claude schema argument comfortably below Linux MAX_ARG_STRLEN.
+const MaxClaudeSchemaBytes = 64 << 10
+
+var environmentName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+func ForbiddenEnvironment(name string) bool {
+	switch name {
+	case "CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SESSION_ID", "CODEX_THREAD_ID", "CODEX_TOOL_CALL_ID":
+		return true
+	}
+	return false
+}
+
 func Load(path string) (*Catalog, error) {
 	b, err := readLimited(path)
 	if err != nil {
@@ -106,6 +121,11 @@ func Load(path string) (*Catalog, error) {
 	for id, backend := range m.Backends {
 		if !namePattern.MatchString(id) || (backend.Kind != "claude" && backend.Kind != "codex") || backend.Executable == "" {
 			return nil, fmt.Errorf("invalid backend %q", id)
+		}
+		for _, name := range backend.EnvironmentAllowlist {
+			if !environmentName.MatchString(name) || ForbiddenEnvironment(name) {
+				return nil, fmt.Errorf("backend %s: invalid or parent-session environment name", id)
+			}
 		}
 		if filepath.IsAbs(backend.Executable) {
 			continue
@@ -138,7 +158,10 @@ func Load(path string) (*Catalog, error) {
 		if err != nil {
 			return nil, fmt.Errorf("tool %s output schema: %w", t.Name, err)
 		}
-		canonical, err := json.Marshal(t)
+		canonical, err := json.Marshal(struct {
+			Tool    Tool
+			Backend Backend
+		}{t, backend})
 		if err != nil {
 			return nil, err
 		}
@@ -178,12 +201,15 @@ func validateExecution(t Tool, backend Backend) error {
 	}
 	switch backend.Kind {
 	case "claude":
+		if len(t.OutputSchema) > MaxClaudeSchemaBytes {
+			return errors.New("Claude outputSchema exceeds the 64 KiB argument limit")
+		}
 		if e.Permissions != "no-tools" || e.Resources != "captured-context" || t.Binding.Extraction != "claude-structured-output" {
 			return errors.New("Claude requires no-tools, captured-context and claude-structured-output")
 		}
 	case "codex":
-		if e.Permissions != "read-only-sandbox" || e.Resources != "live-workspace" || t.Binding.Extraction != "codex-output-file" {
-			return errors.New("Codex requires read-only-sandbox, live-workspace and codex-output-file")
+		if !t.Binding.Experimental || e.Permissions != "read-only-sandbox" || e.Resources != "host-filesystem-readable" || t.Binding.Extraction != "codex-output-file" {
+			return errors.New("Codex requires experimental:true, read-only-sandbox, host-filesystem-readable and codex-output-file")
 		}
 	}
 	return nil

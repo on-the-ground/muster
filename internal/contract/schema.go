@@ -40,61 +40,61 @@ func CompileSchema(raw json.RawMessage, output bool) (*Schema, error) {
 // Validate implements precisely the closed profile accepted by CompileSchema.
 // jsonschema-go v0.4.3 treats json.Number as a string in its type check. Our
 // validator never converts numeric instances through binary64, even temporarily.
-func (s *Schema) Validate(v any) error { return validateNode(s.root, v) }
+func (s *Schema) Validate(v any) error { return validateNode(s.root, v, "$") }
 
-func validateNode(s map[string]any, v any) error {
+func validateNode(s map[string]any, v any, path string) error {
 	switch s["type"] {
 	case "object":
 		m, ok := v.(map[string]any)
 		if !ok {
-			return errors.New("expected object")
+			return fmt.Errorf("%s: expected object", path)
 		}
 		props := s["properties"].(map[string]any)
 		if required, ok := s["required"].([]any); ok {
 			for _, name := range required {
 				if _, exists := m[name.(string)]; !exists {
-					return errors.New("required property missing")
+					return fmt.Errorf("%s[%q]: required property missing", path, name)
 				}
 			}
 		}
 		for name, value := range m {
 			prop, exists := props[name]
 			if !exists {
-				return errors.New("unexpected property")
+				return fmt.Errorf("%s: unexpected property; use only the declared properties", path)
 			}
-			if err := validateNode(prop.(map[string]any), value); err != nil {
+			if err := validateNode(prop.(map[string]any), value, fmt.Sprintf("%s[%q]", path, name)); err != nil {
 				return err
 			}
 		}
 	case "array":
 		a, ok := v.([]any)
 		if !ok {
-			return errors.New("expected array")
+			return fmt.Errorf("%s: expected array", path)
 		}
 		for _, value := range a {
-			if err := validateNode(s["items"].(map[string]any), value); err != nil {
+			if err := validateNode(s["items"].(map[string]any), value, path+"[*]"); err != nil {
 				return err
 			}
 		}
 	case "number", "integer":
 		n, ok := v.(json.Number)
 		if !ok {
-			return errors.New("expected JSON number token")
+			return fmt.Errorf("%s: expected JSON number token", path)
 		}
 		if s["type"] == "integer" && !integerToken(n.String()) {
-			return errors.New("expected integer")
+			return fmt.Errorf("%s: expected integer", path)
 		}
 	case "string":
 		if _, ok := v.(string); !ok {
-			return errors.New("expected string")
+			return fmt.Errorf("%s: expected string", path)
 		}
 	case "boolean":
 		if _, ok := v.(bool); !ok {
-			return errors.New("expected boolean")
+			return fmt.Errorf("%s: expected boolean", path)
 		}
 	case "null":
 		if v != nil {
-			return errors.New("expected null")
+			return fmt.Errorf("%s: expected null", path)
 		}
 	}
 	return nil

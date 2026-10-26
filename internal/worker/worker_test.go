@@ -44,6 +44,11 @@ func TestCLIAdaptersUseSeparateProcessesAndExactOutput(t *testing.T) {
 				}
 				out, err := p.Wait()
 				cancel()
+				_ = p.Cancel()
+				again, _ := p.Wait()
+				if again.CancelRequested || again.CancelReason != "" {
+					t.Fatal("late cancellation changed completed worker evidence")
+				}
 				if err != nil {
 					t.Fatal(err)
 				}

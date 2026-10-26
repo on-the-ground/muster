@@ -3,6 +3,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -23,12 +24,19 @@ func New(c *contract.Catalog, p *proxy.Proxy) *mcp.Server {
 	})
 	for _, t := range c.Tools {
 		d := t.Definition
+		if d.Binding.Experimental {
+			d.Description = "[Experimental; host filesystem readable] " + d.Description
+		}
 		s.AddTool(&mcp.Tool{Name: d.Name, Description: d.Description, InputSchema: d.InputSchema, OutputSchema: d.OutputSchema}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			r := p.Call(ctx, d.Name, req.Params.Arguments)
 			result := &mcp.CallToolResult{Meta: mcp.Meta{"muster/evidence": r.Evidence}}
 			if r.Error != "" {
 				result.IsError = true
-				result.Content = []mcp.Content{&mcp.TextContent{Text: r.Error}}
+				message := r.Error
+				if r.Message != "" {
+					message += ": " + r.Message
+				}
+				result.Content = []mcp.Content{&mcp.TextContent{Text: message}}
 			} else {
 				result.StructuredContent = json.RawMessage(r.Output)
 				result.Content = []mcp.Content{&mcp.TextContent{Text: string(r.Output)}}
@@ -57,7 +65,7 @@ func (r *GuardedReader) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	if len(r.pending) == 0 {
+	for len(r.pending) == 0 {
 		if !r.scanner.Scan() {
 			if err := r.scanner.Err(); err != nil {
 				return 0, errors.New("invalid or oversized MCP frame")
@@ -65,6 +73,9 @@ func (r *GuardedReader) Read(p []byte) (int, error) {
 			return 0, io.EOF
 		}
 		line := r.scanner.Bytes()
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
 		if _, err := strictjson.Object(line); err != nil {
 			return 0, errors.New("invalid MCP JSON: duplicate keys, malformed JSON or limits exceeded")
 		}
