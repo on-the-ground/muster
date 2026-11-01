@@ -26,7 +26,7 @@ func main() {
 			return
 		}
 		if a == "--help" {
-			for _, flag := range strings.Fields("--json-schema --output-format --tools --safe-mode --strict-mcp-config --mcp-config --permission-mode --setting-sources --no-session-persistence --disable-slash-commands --settings --output-schema --output-last-message --sandbox --ephemeral --ignore-user-config --ignore-rules") {
+			for _, flag := range strings.Fields("--json-schema --output-format --tools --allowedTools --verbose --safe-mode --strict-mcp-config --mcp-config --permission-mode --setting-sources --no-session-persistence --disable-slash-commands --settings --output-schema --output-last-message --sandbox --ephemeral --ignore-user-config --ignore-rules") {
 				fmt.Println("  " + flag + " <value>")
 			}
 			return
@@ -51,6 +51,10 @@ func main() {
 	}
 	_ = json.Unmarshal(input.Arguments, &mode)
 	codex := len(args) > 0 && args[0] == "exec"
+	if !codex && strings.Contains(strings.Join(args, "|"), "--output-format|stream-json") {
+		stream(args, mode.Mode, input.Arguments)
+		return
+	}
 	if codex {
 		fmt.Printf("{\"type\":\"thread.started\",\"thread_id\":\"fixture-codex-%d\"}\n", os.Getpid())
 	}
@@ -127,4 +131,71 @@ func main() {
 	} else {
 		fmt.Printf("{\"is_error\":false,\"session_id\":\"fixture-claude-%d\",\"structured_output\":%s}\n", os.Getpid(), output)
 	}
+}
+
+// stream emulates Claude's stream-json event protocol for web-read workers.
+// It is a protocol fixture: it makes no web request.
+func stream(args []string, mode string, arguments json.RawMessage) {
+	session := fmt.Sprintf("fixture-claude-%d", os.Getpid())
+	flag := func(name string) string {
+		for i, a := range args {
+			if a == name && i+1 < len(args) {
+				return args[i+1]
+			}
+		}
+		return ""
+	}
+	tools := strings.Split(flag("--tools"), ",")
+	if mode == "extra-tool" {
+		tools = append(tools, "Bash")
+	}
+	emit := func(v any) {
+		b, _ := json.Marshal(v)
+		fmt.Println(string(b))
+	}
+	use := func(id, name string, input any) {
+		emit(map[string]any{"type": "assistant", "session_id": session, "message": map[string]any{"content": []any{map[string]any{"type": "tool_use", "id": id, "name": name, "input": input}}}})
+	}
+	result := func(id, content string, isError bool) {
+		emit(map[string]any{"type": "user", "session_id": session, "message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": id, "content": content, "is_error": isError}}}})
+	}
+	emit(map[string]any{"type": "system", "subtype": "init", "session_id": session, "tools": append(tools, "StructuredOutput")})
+	emit(map[string]any{"type": "stream_event", "session_id": session, "event": map[string]any{"type": "content_block_delta"}})
+	var denials []any
+	switch mode {
+	case "permission":
+		joined := strings.Join(args, "|")
+		if flag("--tools") != "WebSearch,WebFetch" || !strings.Contains(joined, "--permission-mode|dontAsk") || !strings.Contains(joined, "--strict-mcp-config") || !strings.Contains(joined, "--verbose") {
+			os.Exit(8)
+		}
+		fmt.Fprintln(os.Stderr, "allowed:", flag("--allowedTools"))
+		if allow := os.Getenv("MUSTER_FIXTURE_EXPECT_ALLOW"); allow != "" && flag("--allowedTools") != allow {
+			os.Exit(17)
+		}
+	case "web":
+		use("s1", "WebSearch", map[string]any{"query": "fixture query"})
+		result("s1", `Links: [{"title":"A","url":"https://a.example/page"}]`, false)
+		use("f1", "WebFetch", map[string]any{"url": "https://a.example/page", "prompt": "read"})
+		result("f1", "fixture page text", false)
+	case "deny":
+		use("f1", "WebFetch", map[string]any{"url": "https://blocked.example/", "prompt": "read"})
+		result("f1", "permission denied", true)
+		denials = append(denials, map[string]any{"tool_name": "WebFetch", "tool_use_id": "f1"})
+	case "rogue-tool":
+		use("b1", "Bash", map[string]any{"command": "true"})
+		time.Sleep(time.Hour)
+	case "web-sleep", "sleep":
+		if mode == "web-sleep" {
+			use("f1", "WebFetch", map[string]any{"url": "https://slow.example/", "prompt": "read"})
+		}
+		time.Sleep(time.Hour)
+	case "crash":
+		os.Exit(7)
+	}
+	if mode == "extra-tool" {
+		time.Sleep(time.Hour)
+	}
+	use("o1", "StructuredOutput", json.RawMessage(arguments))
+	result("o1", "Structured output provided successfully", false)
+	emit(map[string]any{"type": "result", "subtype": "success", "is_error": false, "session_id": session, "structured_output": json.RawMessage(arguments), "permission_denials": append([]any{}, denials...)})
 }

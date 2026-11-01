@@ -20,15 +20,21 @@ func New(c *contract.Catalog, p *proxy.Proxy) *mcp.Server {
 	s := mcp.NewServer(&mcp.Implementation{Name: "muster", Version: "0.1.0"}, &mcp.ServerOptions{
 		Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{ListChanged: false}},
 		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Instructions: "Calls execute registered contracts in fresh agent sessions. Calls are never automatically retried. Cancellation is best-effort process termination, not rollback. The catalog is fixed until restart.",
+		Instructions: "Calls execute registered contracts in fresh agent sessions. When every worker slot is busy, calls wait in a bounded queue; a call beyond it is refused before any worker starts. Calls are never automatically retried. Cancellation of a queued call guarantees no worker ran; cancellation of a running call is best-effort process termination, not rollback. The catalog is fixed until restart.",
 	})
+	yes, no := true, false
 	for _, t := range c.Tools {
 		d := t.Definition
 		if d.Binding.Experimental {
 			d.Description = "[Experimental; host filesystem readable] " + d.Description
 		}
-		s.AddTool(&mcp.Tool{Name: d.Name, Description: d.Description, InputSchema: d.InputSchema, OutputSchema: d.OutputSchema}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			r := p.Call(ctx, d.Name, req.Params.Arguments)
+		annotations := &mcp.ToolAnnotations{ReadOnlyHint: true, DestructiveHint: &no, OpenWorldHint: &no}
+		if d.Execution.Permissions == contract.PermissionWebRead {
+			d.Description = "[Sends web searches and fetches; queries and URLs are recorded] " + d.Description
+			annotations.OpenWorldHint = &yes
+		}
+		s.AddTool(&mcp.Tool{Name: d.Name, Description: d.Description, InputSchema: d.InputSchema, OutputSchema: d.OutputSchema, Annotations: annotations}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			r := p.Call(ctx, d.Name, req.Params.Arguments, req.Params.Meta)
 			result := &mcp.CallToolResult{Meta: mcp.Meta{"muster/evidence": r.Evidence}}
 			if r.Error != "" {
 				result.IsError = true

@@ -12,6 +12,7 @@ import (
 type process struct {
 	cmd             *exec.Cmd
 	stdout, stderr  boundedBuffer
+	stream          *streamParser
 	kind, dir       string
 	cleanup         func()
 	done            chan struct{}
@@ -25,10 +26,10 @@ type process struct {
 }
 
 func launch(ctx context.Context, binary string, args []string, dir string, prompt []byte, env []string) (*process, error) {
-	return launchConfigured(ctx, binary, args, dir, prompt, env, "", nil)
+	return launchConfigured(ctx, binary, args, dir, prompt, env, "", nil, nil)
 }
 
-func launchConfigured(ctx context.Context, binary string, args []string, dir string, prompt []byte, env []string, kind string, cleanup func()) (*process, error) {
+func launchConfigured(ctx context.Context, binary string, args []string, dir string, prompt []byte, env []string, kind string, tools []string, cleanup func()) (*process, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -37,6 +38,10 @@ func launchConfigured(ctx context.Context, binary string, args []string, dir str
 	p.cmd.Env = env
 	p.cmd.Stdin = bytes.NewReader(prompt)
 	p.cmd.Stdout, p.cmd.Stderr = &p.stdout, &p.stderr
+	if kind == "claude-stream" {
+		p.stream = newStreamParser(tools, func() { _ = p.cancel("policy") })
+		p.cmd.Stdout = p.stream
+	}
 	p.cmd.WaitDelay = 2 * time.Second
 	configureProcess(p.cmd)
 	if err := p.cmd.Start(); err != nil {
@@ -107,9 +112,15 @@ func (p *process) run(ctx context.Context) {
 	p.out = Outcome{Started: true, ParentExited: parentExited, Terminated: parentExited && gone && observeErr == nil && killErr == nil && !pipeDelay, CancelRequested: cancelled, CancelReason: reason}
 	output, session, parseErr := p.parseOutput()
 	p.out.SessionID = session
+	if p.stream != nil {
+		_, _, p.out.Effects, p.out.DeniedTools, _ = p.stream.outcome()
+	}
 	switch {
 	case pipeDelay:
 		p.err = ErrWaitDelay
+	case errors.Is(parseErr, ErrPolicy):
+		// The job was stopped for using an undeclared tool; report that first.
+		p.err = parseErr
 	case observeErr != nil || waitErr != nil || killErr != nil:
 		p.err = errors.New("worker exit or process-group cleanup failed")
 	case parseErr != nil:

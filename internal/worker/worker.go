@@ -22,12 +22,24 @@ import (
 type Request struct {
 	Prompt []byte
 	Schema json.RawMessage
+	// Web, when set, runs a web-read worker with only WebSearch and WebFetch.
+	Web *WebAccess
 }
+
+// WebAccess is a web-read tool's native permission. Empty FetchDomains
+// allows WebFetch on any host.
+type WebAccess struct {
+	FetchDomains []string
+}
+
 type Outcome struct {
 	Output                                             json.RawMessage
 	SessionID                                          string
 	Started, ParentExited, Terminated, CancelRequested bool
 	CancelReason                                       string
+	// Effects and DeniedTools are observed native tool uses (web-read only).
+	Effects     []Effect
+	DeniedTools []string
 }
 type Process interface {
 	Cancel() error
@@ -80,7 +92,7 @@ func (b *CLI) Check(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	args := []string{"--help"}
-	required := []string{"--json-schema", "--output-format", "--tools", "--safe-mode", "--strict-mcp-config", "--mcp-config", "--permission-mode", "--setting-sources", "--no-session-persistence", "--disable-slash-commands", "--settings"}
+	required := []string{"--json-schema", "--output-format", "--tools", "--allowedTools", "--verbose", "--safe-mode", "--strict-mcp-config", "--mcp-config", "--permission-mode", "--setting-sources", "--no-session-persistence", "--disable-slash-commands", "--settings"}
 	if b.kind == "codex" {
 		args = []string{"exec", "--help"}
 		required = []string{"--output-schema", "--output-last-message", "--sandbox", "--ephemeral", "--ignore-user-config", "--ignore-rules"}
@@ -130,9 +142,31 @@ func (b *CLI) Start(ctx context.Context, r Request) (Process, error) {
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
 	var args []string
+	kind := b.kind
+	var tools []string
+	if r.Web != nil && b.kind != "claude" {
+		cleanup()
+		return nil, errors.New("web-read is supported by the Claude adapter only")
+	}
 	switch b.kind {
 	case "claude":
-		args = []string{"-p", "--safe-mode", "--output-format", "json", "--json-schema", string(r.Schema), "--tools", "", "--strict-mcp-config", "--mcp-config", `{"mcpServers":{}}`, "--setting-sources", "", "--settings", `{"disableAllHooks":true}`, "--disable-slash-commands", "--no-session-persistence", "--permission-mode", "dontAsk"}
+		isolation := []string{"--strict-mcp-config", "--mcp-config", `{"mcpServers":{}}`, "--setting-sources", "", "--settings", `{"disableAllHooks":true}`, "--disable-slash-commands", "--no-session-persistence", "--permission-mode", "dontAsk"}
+		if r.Web == nil {
+			args = append([]string{"-p", "--safe-mode", "--output-format", "json", "--json-schema", string(r.Schema), "--tools", ""}, isolation...)
+			break
+		}
+		// Only the two web tools exist in the session, and dontAsk refuses any
+		// use the allow rules do not cover. The stream reports each use.
+		tools = []string{"WebSearch", "WebFetch"}
+		allow := []string{"WebSearch"}
+		if len(r.Web.FetchDomains) == 0 {
+			allow = append(allow, "WebFetch")
+		}
+		for _, d := range r.Web.FetchDomains {
+			allow = append(allow, "WebFetch(domain:"+d+")")
+		}
+		kind = "claude-stream"
+		args = append([]string{"-p", "--safe-mode", "--output-format", "stream-json", "--verbose", "--json-schema", string(r.Schema), "--tools", strings.Join(tools, ","), "--allowedTools", strings.Join(allow, ",")}, isolation...)
 	case "codex":
 		if err := os.WriteFile(filepath.Join(dir, "schema.json"), r.Schema, 0600); err != nil {
 			cleanup()
@@ -140,7 +174,7 @@ func (b *CLI) Start(ctx context.Context, r Request) (Process, error) {
 		}
 		args = []string{"exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only", "-c", `approval_policy="never"`, "-c", `web_search="disabled"`, "-c", `features.shell_tool=false`, "-c", `features.apply_patch=false`, "--output-schema", filepath.Join(dir, "schema.json"), "--output-last-message", filepath.Join(dir, "result.json"), "--json", "-"}
 	}
-	p, err := launchConfigured(ctx, b.executable, args, dir, r.Prompt, b.environment, b.kind, cleanup)
+	p, err := launchConfigured(ctx, b.executable, args, dir, r.Prompt, b.environment, kind, tools, cleanup)
 	if err != nil {
 		cleanup()
 		return nil, err
@@ -164,6 +198,9 @@ var ErrWaitDelay = errors.New("worker output pipes remained open after parent ex
 // known native session on crashes/cancellation, without returning failed output.
 func (p *process) parseOutput() (json.RawMessage, string, error) {
 	switch p.kind {
+	case "claude-stream":
+		output, session, _, _, err := p.stream.outcome()
+		return output, session, err
 	case "claude":
 		m, err := strictjson.Fields(p.stdout.Bytes())
 		if err != nil {

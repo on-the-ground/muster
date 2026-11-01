@@ -176,3 +176,86 @@ func TestCodexRequiresExplicitExperimentalHostReadScope(t *testing.T) {
 		t.Fatal("ambiguous Codex read scope accepted")
 	}
 }
+
+func webManifest() Manifest {
+	m := validManifest()
+	m.Tools[0].Execution.Permissions = PermissionWebRead
+	m.Tools[0].Execution.Effect = EffectExternal
+	m.Tools[0].Execution.Resources = ResourcesWeb
+	return m
+}
+
+func TestWebReadProfile(t *testing.T) {
+	m := webManifest()
+	m.Tools[0].Binding.WebFetchDomains = []string{"gbis.go.kr", "namu.wiki"}
+	if _, err := loadManifest(t, m); err != nil {
+		t.Fatal(err)
+	}
+	for name, change := range map[string]func(*Manifest){
+		"read-only effect":  func(m *Manifest) { m.Tools[0].Execution.Effect = EffectReadOnly },
+		"captured resource": func(m *Manifest) { m.Tools[0].Execution.Resources = ResourcesCaptured },
+		"no-tools external": func(m *Manifest) { m.Tools[0].Execution.Permissions = PermissionNoTools },
+		"domain casing":     func(m *Manifest) { m.Tools[0].Binding.WebFetchDomains = []string{"Namu.Wiki"} },
+		"domain path":       func(m *Manifest) { m.Tools[0].Binding.WebFetchDomains = []string{"namu.wiki/w"} },
+		"domain wildcard":   func(m *Manifest) { m.Tools[0].Binding.WebFetchDomains = []string{"*.go.kr"} },
+		"duplicate domain":  func(m *Manifest) { m.Tools[0].Binding.WebFetchDomains = []string{"a.example", "a.example"} },
+		"codex web": func(m *Manifest) {
+			m.Backends["worker"] = Backend{Kind: "codex", Executable: "codex"}
+			m.Tools[0].Binding.Experimental = true
+			m.Tools[0].Binding.Extraction = "codex-output-file"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := webManifest()
+			change(&m)
+			if _, err := loadManifest(t, m); err == nil {
+				t.Fatal("accepted")
+			}
+		})
+	}
+	m = validManifest()
+	m.Tools[0].Binding.WebFetchDomains = []string{"a.example"}
+	if _, err := loadManifest(t, m); err == nil {
+		t.Fatal("webFetchDomains accepted on a no-tools tool")
+	}
+}
+
+func TestPoolAndCorrelationConfiguration(t *testing.T) {
+	c, err := loadManifest(t, validManifest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Pool != (Pool{Workers: 1}) || c.Correlation != nil {
+		t.Fatalf("defaults %+v %v", c.Pool, c.Correlation)
+	}
+	m := validManifest()
+	m.Pool = &Pool{Workers: 4, QueueLimit: 16}
+	m.Correlation = &Correlation{MetaKeys: []string{"subsea/callRef"}}
+	if c, err = loadManifest(t, m); err != nil || c.Pool.Workers != 4 || c.Pool.QueueLimit != 16 || c.Correlation[0] != "subsea/callRef" {
+		t.Fatalf("configured %+v %v", c, err)
+	}
+	for name, change := range map[string]func(*Manifest){
+		"no workers":    func(m *Manifest) { m.Pool = &Pool{Workers: 0} },
+		"too many":      func(m *Manifest) { m.Pool = &Pool{Workers: MaxWorkers + 1} },
+		"negative":      func(m *Manifest) { m.Pool = &Pool{Workers: 1, QueueLimit: -1} },
+		"queue":         func(m *Manifest) { m.Pool = &Pool{Workers: 1, QueueLimit: MaxQueueLimit + 1} },
+		"no keys":       func(m *Manifest) { m.Correlation = &Correlation{} },
+		"duplicate key": func(m *Manifest) { m.Correlation = &Correlation{MetaKeys: []string{"a", "a"}} },
+		"bad key":       func(m *Manifest) { m.Correlation = &Correlation{MetaKeys: []string{"a b"}} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := validManifest()
+			change(&m)
+			if _, err := loadManifest(t, m); err == nil {
+				t.Fatal("accepted")
+			}
+		})
+	}
+	b, _ := json.Marshal(validManifest())
+	body := strings.Replace(string(b), `"version":1`, `"version":1,"pool":{"workers":2,"queueLimit":1,"Workers":9}`, 1)
+	p := filepath.Join(t.TempDir(), "manifest.json")
+	_ = os.WriteFile(p, []byte(body), 0600)
+	if _, err := Load(p); err == nil {
+		t.Fatal("case alias in pool accepted")
+	}
+}

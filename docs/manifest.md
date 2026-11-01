@@ -10,6 +10,8 @@ in the native worker's authentication setup, never manifest instructions/context
 | Field | Meaning |
 | --- | --- |
 | `version` | Exactly `1`. |
+| `pool` | Optional `{workers, queueLimit}`: this instance's credit. `workers` 1–64 execution slots shared by all tools; `queueLimit` 0–1024 calls waiting for a slot (FIFO). Beyond both a call is refused as `overloaded` before dispatch. Default `{workers:1, queueLimit:0}`. |
+| `correlation.metaKeys` | Optional 1–8 request `_meta` key names (letters, digits, `._/-`). A present value must be a printable string of 1–256 bytes; it is recorded uninterpreted in every evidence record of the job. Other values refuse the call (`invalid_correlation`). |
 | `backends` | Operator IDs mapped to `kind` (`claude` or `codex`) and `executable` (PATH basename or absolute path). |
 | `backends.<id>.environmentAllowlist` | Additional operator-approved environment variable names. The shipped backend allowlist and proxy/CA trust settings are preserved; parent session names cannot be enabled. Values are never stored here. |
 | `tools` | 1–100 unique tools. |
@@ -21,11 +23,12 @@ in the native worker's authentication setup, never manifest instructions/context
 | `binding.experimental` | Required `true` for Codex until native denial scenarios are verified; optional/false for Claude. |
 | `binding.extraction` | `claude-structured-output` or `codex-output-file`, matching the backend. |
 | `binding.context` | Named `{name,path}` text files captured once at startup. Names must be unique. Relative paths use the manifest directory. |
-| `execution.permissions` | Claude: `no-tools`; Codex: `read-only-sandbox`. Other claims are refused. |
-| `execution.effect` | Exactly `read-only`, referring to task effects, not the CLI control plane. |
+| `binding.webFetchDomains` | web-read only. Unique lower-case host names; WebFetch is allowed on these hosts only (`WebFetch(domain:...)` rules). Empty or omitted allows any host. WebSearch is not restricted by it. |
+| `execution.permissions` | Claude: `no-tools` or `web-read` (only `WebSearch`/`WebFetch`); Codex: `read-only-sandbox`. Other claims are refused. |
+| `execution.effect` | `read-only` with `no-tools` or Codex; `external-read` with `web-read`, because searches and fetches are requests to other services. It refers to task effects, not the CLI control plane. |
 | `execution.cancellation` | Exactly `terminate-process-group`; best-effort, without rollback. |
 | `execution.reuseSession` | False. Each dispatch uses a fresh process/session. |
-| `execution.resources` | Claude: `captured-context`; Codex: `host-filesystem-readable`. Captured context is fixed; Codex's host resources are not a fixed revision. Its cwd is a fresh temporary directory, but files elsewhere on the host readable by its OS user are not confined or snapshotted. The binding is explicitly experimental. |
+| `execution.resources` | Claude: `captured-context`, or `captured-context+web` with `web-read`; Codex: `host-filesystem-readable`. Captured context is fixed; Codex's host resources are not a fixed revision. Its cwd is a fresh temporary directory, but files elsewhere on the host readable by its OS user are not confined or snapshotted. The binding is explicitly experimental. |
 | `execution.timeoutSeconds` | Integer 1–3600. |
 
 The instruction text defines role, goals, evidence needs, data handling and
