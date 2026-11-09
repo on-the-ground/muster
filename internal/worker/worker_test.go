@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -105,5 +106,118 @@ func TestFailedProbeAndCrash(t *testing.T) {
 	out, err := p.Wait()
 	if err == nil || !out.Terminated || out.SessionID == "" || strings.Contains(err.Error(), "PRIVATE_CREDENTIAL") {
 		t.Fatal("crash not sanitized")
+	}
+}
+
+func startWeb(t *testing.T, binary, mode string, timeout time.Duration, domains ...string) (Outcome, error) {
+	t.Helper()
+	b, err := New(contract.Backend{Kind: "claude", Executable: binary})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	p, err := b.Start(ctx, Request{Prompt: []byte(`{"instructions":{"text":"Research."},"arguments":{"n":1,"mode":"` + mode + `"}}`), Schema: json.RawMessage(`{"type":"object"}`), Web: &WebAccess{FetchDomains: domains}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p.Wait()
+}
+
+// A web-read worker runs with only the two web tools and reports each use as
+// an effect with its target, completion and result hash.
+func TestWebReadRecordsEachToolUseAsAnEffect(t *testing.T) {
+	binary := fixture(t)
+	out, err := startWeb(t, binary, "web", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out.Output) != `{"n":1,"mode":"web"}` || out.SessionID == "" || !out.Terminated {
+		t.Fatalf("outcome %+v", out)
+	}
+	if len(out.Effects) != 2 {
+		t.Fatalf("effects %+v", out.Effects)
+	}
+	search, fetch := out.Effects[0], out.Effects[1]
+	if search.Tool != "WebSearch" || search.Target != "fixture query" || search.Status != "ok" || search.CompletedAt == nil || search.ResultHash == "" || len(search.ObservedURLs) != 1 || search.ObservedURLs[0] != "https://a.example/page" {
+		t.Fatalf("search effect %+v", search)
+	}
+	if fetch.Tool != "WebFetch" || fetch.Target != "https://a.example/page" || fetch.Status != "ok" || fetch.RequestedAt.After(*fetch.CompletedAt) {
+		t.Fatalf("fetch effect %+v", fetch)
+	}
+}
+
+// The native permission flags are exact: only WebSearch and WebFetch exist,
+// dontAsk refuses anything the allow rules do not cover, and domains narrow
+// WebFetch.
+func TestWebReadPermissionFlags(t *testing.T) {
+	binary := fixture(t)
+	t.Setenv("MUSTER_FIXTURE_EXPECT_ALLOW", "WebSearch,WebFetch")
+	if _, err := startWeb(t, binary, "permission", 5*time.Second); err != nil {
+		t.Fatalf("unrestricted: %v", err)
+	}
+	t.Setenv("MUSTER_FIXTURE_EXPECT_ALLOW", "WebSearch,WebFetch(domain:a.example),WebFetch(domain:b.example)")
+	if _, err := startWeb(t, binary, "permission", 5*time.Second, "a.example", "b.example"); err != nil {
+		t.Fatalf("domains: %v", err)
+	}
+	codex, err := New(contract.Backend{Kind: "codex", Executable: binary})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := codex.Start(context.Background(), Request{Prompt: []byte(`{}`), Web: &WebAccess{}}); err == nil {
+		t.Fatal("codex accepted web-read")
+	}
+}
+
+// A native refusal is evidence, not a hidden success: the effect is marked
+// denied and the denied tool is listed.
+func TestWebReadDenialIsRecorded(t *testing.T) {
+	out, err := startWeb(t, fixture(t), "deny", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Effects) != 1 || out.Effects[0].Status != "denied" || len(out.DeniedTools) != 1 || out.DeniedTools[0] != "WebFetch" {
+		t.Fatalf("denial %+v %v", out.Effects, out.DeniedTools)
+	}
+}
+
+// A worker that exposes or uses an undeclared tool is stopped as soon as the
+// stream shows it.
+func TestUndeclaredToolStopsTheWorker(t *testing.T) {
+	binary := fixture(t)
+	for _, mode := range []string{"extra-tool", "rogue-tool"} {
+		t.Run(mode, func(t *testing.T) {
+			start := time.Now()
+			out, err := startWeb(t, binary, mode, 30*time.Second)
+			if !errors.Is(err, ErrPolicy) || !out.CancelRequested || !out.Terminated || time.Since(start) > 5*time.Second {
+				t.Fatalf("not stopped for policy: %+v %v", out, err)
+			}
+		})
+	}
+}
+
+// Cancelling during a tool use keeps the effect, still "requested": it may
+// have reached the remote service.
+func TestCancelledWebReadKeepsRequestedEffect(t *testing.T) {
+	out, err := startWeb(t, fixture(t), "web-sleep", 300*time.Millisecond)
+	if err == nil || !out.CancelRequested || !out.Terminated {
+		t.Fatalf("not cancelled: %+v %v", out, err)
+	}
+	if len(out.Effects) != 1 || out.Effects[0].Status != "requested" || out.Effects[0].Target != "https://slow.example/" {
+		t.Fatalf("effect %+v", out.Effects)
+	}
+}
+
+// Review of #4: past the effect limit the audit is incomplete, so the worker
+// is stopped at once and the outcome says so, instead of running on with
+// unrecorded requests.
+func TestEffectLimitStopsTheWorkerAndMarksTheAuditIncomplete(t *testing.T) {
+	start := time.Now()
+	out, err := startWeb(t, fixture(t), "flood", 30*time.Second)
+	if !errors.Is(err, ErrAuditLimit) || !out.CancelRequested || !out.Terminated || time.Since(start) > 10*time.Second {
+		t.Fatalf("not stopped at the audit limit: %+v %v", out.CancelReason, err)
+	}
+	if !out.AuditIncomplete || len(out.Effects) != maxEffects || out.CancelReason != "audit-limit" {
+		t.Fatalf("audit %v, %d effects, reason %q", out.AuditIncomplete, len(out.Effects), out.CancelReason)
 	}
 }

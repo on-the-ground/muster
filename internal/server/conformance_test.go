@@ -227,7 +227,7 @@ func TestMCPCancellationStopsWorker(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		b, _ := os.ReadFile(evidence)
-		if bytes.Contains(b, []byte("worker-started")) {
+		if bytes.Contains(b, []byte("job-dispatched")) {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -260,7 +260,7 @@ func TestDisconnectStopsWorker(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		b, _ := os.ReadFile(evidence)
-		if bytes.Contains(b, []byte("worker-started")) {
+		if bytes.Contains(b, []byte("job-dispatched")) {
 			break
 		}
 		if time.Now().After(deadline) {

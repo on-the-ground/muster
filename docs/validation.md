@@ -93,3 +93,43 @@ external filesystem isolation. This follows the review's explicit experimental
 alternative rather than describing fixture flags as native enforcement proof.
 
 The optional Subsea adapter and Vessel #67 integration remain separate work.
+
+## Issue #3: credit pool, correlation and web read (2026-11-01)
+
+Current-instance evidence for issue #3, Linux, Go 1.25.14, Claude Code 2.1.310
+authenticated (`claude auth status`: logged in). Not a CI result.
+
+**Offline** (`go test -race ./...`, deterministic fixtures, no model request):
+
+- Pool: two slots run two calls at once and never a third; the next queued
+  call is pulled FIFO when a slot frees; a full queue refuses with `overloaded`
+  before admission; a cancelled queued call ends `cancelled_before_dispatch`
+  and the slot goes to the next call; shutdown ends queued calls without
+  dispatch. The same over stdio with the official SDK client, including MCP
+  `notifications/cancelled` of a queued call.
+- Correlation: the configured `subsea/callRef` value is in the admitted,
+  dispatched and finished records, including for a cancelled call; malformed
+  values refuse the call; other `_meta` keys are not recorded.
+- Web read: the fixture emulates Claude `stream-json`. Effects carry target,
+  times, status and result hash; native denials are `denied`; a session listing
+  or using an undeclared tool is stopped (`permission_violation`); an effect
+  interrupted by cancellation stays `requested`. Exact `--tools`,
+  `--allowedTools` and `dontAsk` flags are checked, including
+  `WebFetch(domain:...)` rules. These fixtures do not prove native enforcement.
+
+**Real CLI** (opt-in tests, actual model requests):
+
+- `TestNativeWebFetchDomainDenial` passed: with `webFetchDomains:["gbis.go.kr"]`,
+  the worker's WebFetch of `https://example.com/` was refused by the CLI and
+  recorded as a `denied` effect and in `deniedTools`.
+- `TestNativeWebWorker` passed with `examples/claude-web.json`: one call with
+  `subsea/callRef` recorded in all three records, a native session distinct
+  from the parent session, 16 effects (9 WebSearch `ok`, 7 WebFetch `error`),
+  and all 10 cited URLs found in recorded search results.
+- The WebFetch errors are this cloud environment's network policy (the egress
+  proxy refuses those hosts), not muster behaviour. WebSearch ran on the
+  provider side and succeeded. Page reads therefore remain unverified here.
+- A direct CLI probe confirmed the stream shape muster parses: an `init` event
+  listing only `WebSearch`, `WebFetch` and `StructuredOutput`, `tool_use` /
+  `tool_result` blocks and a final `result` with `structured_output` and
+  `permission_denials`.

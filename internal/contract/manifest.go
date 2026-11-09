@@ -18,10 +18,34 @@ import (
 )
 
 type Manifest struct {
-	Version  int                `json:"version"`
-	Backends map[string]Backend `json:"backends"`
-	Tools    []Tool             `json:"tools"`
+	Version     int                `json:"version"`
+	Pool        *Pool              `json:"pool,omitempty"`
+	Correlation *Correlation       `json:"correlation,omitempty"`
+	Backends    map[string]Backend `json:"backends"`
+	Tools       []Tool             `json:"tools"`
 }
+
+// Pool is this muster instance's credit: Workers execution slots shared by all
+// of its tools, and at most QueueLimit admitted calls waiting for a slot. A
+// call beyond both is refused before dispatch. There is no wait deadline;
+// callers cancel. Omitted, it is one slot and no queue.
+type Pool struct {
+	Workers    int `json:"workers"`
+	QueueLimit int `json:"queueLimit"`
+}
+
+// Correlation names request _meta keys whose string values are recorded,
+// uninterpreted, in the evidence of each admitted call.
+type Correlation struct {
+	MetaKeys []string `json:"metaKeys"`
+}
+
+const (
+	MaxWorkers      = 64
+	MaxQueueLimit   = 1024
+	MaxMetaKeys     = 8
+	MaxMetaValueLen = 256
+)
 
 // Executable is operator configuration, never caller-controlled. No arbitrary
 // per-call flags, environment variables or session identifiers are accepted.
@@ -42,7 +66,21 @@ type Binding struct {
 	Experimental bool          `json:"experimental,omitempty"`
 	Extraction   string        `json:"extraction"`
 	Context      []ContextFile `json:"context"`
+	// WebFetchDomains, for web-read tools only, restricts WebFetch to these
+	// hosts. Empty allows any host. WebSearch is not restricted by it.
+	WebFetchDomains []string `json:"webFetchDomains,omitempty"`
 }
+
+// Permission and effect profiles. A web-read tool sends requests to external
+// services; that is an effect, though it is declared as reading.
+const (
+	PermissionNoTools = "no-tools"
+	PermissionWebRead = "web-read"
+	EffectReadOnly    = "read-only"
+	EffectExternal    = "external-read"
+	ResourcesCaptured = "captured-context"
+	ResourcesWeb      = "captured-context+web"
+)
 
 type ContextFile struct {
 	Name string `json:"name"`
@@ -84,8 +122,10 @@ type LoadedTool struct {
 }
 
 type Catalog struct {
-	Backends map[string]Backend
-	Tools    []LoadedTool
+	Backends    map[string]Backend
+	Tools       []LoadedTool
+	Pool        Pool
+	Correlation []string
 }
 
 func Hash(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
@@ -96,6 +136,10 @@ var namePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
 const MaxClaudeSchemaBytes = 64 << 10
 
 var environmentName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+var metaKeyPattern = regexp.MustCompile(`^[A-Za-z0-9._/-]{1,128}$`)
+
+var domainPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
 
 func ForbiddenEnvironment(name string) bool {
 	switch name {
@@ -117,7 +161,26 @@ func Load(path string) (*Catalog, error) {
 	if m.Version != 1 || len(m.Tools) == 0 || len(m.Tools) > 100 {
 		return nil, errors.New("manifest version must be 1 with 1..100 tools")
 	}
-	c := &Catalog{Backends: m.Backends}
+	c := &Catalog{Backends: m.Backends, Pool: Pool{Workers: 1}}
+	if m.Pool != nil {
+		if m.Pool.Workers < 1 || m.Pool.Workers > MaxWorkers || m.Pool.QueueLimit < 0 || m.Pool.QueueLimit > MaxQueueLimit {
+			return nil, fmt.Errorf("pool requires workers 1..%d and queueLimit 0..%d", MaxWorkers, MaxQueueLimit)
+		}
+		c.Pool = *m.Pool
+	}
+	if m.Correlation != nil {
+		keys := map[string]bool{}
+		if len(m.Correlation.MetaKeys) == 0 || len(m.Correlation.MetaKeys) > MaxMetaKeys {
+			return nil, fmt.Errorf("correlation requires 1..%d metaKeys", MaxMetaKeys)
+		}
+		for _, k := range m.Correlation.MetaKeys {
+			if !metaKeyPattern.MatchString(k) || keys[k] {
+				return nil, errors.New("correlation metaKeys must be unique names of letters, digits and ._/-")
+			}
+			keys[k] = true
+		}
+		c.Correlation = m.Correlation.MetaKeys
+	}
 	for id, backend := range m.Backends {
 		if !namePattern.MatchString(id) || (backend.Kind != "claude" && backend.Kind != "codex") || backend.Executable == "" {
 			return nil, fmt.Errorf("invalid backend %q", id)
@@ -196,20 +259,33 @@ func validateExecution(t Tool, backend Backend) error {
 	if e.ReuseSession || e.Cancellation != "terminate-process-group" || e.TimeoutSeconds < 1 || e.TimeoutSeconds > 3600 {
 		return errors.New("require fresh sessions, terminate-process-group cancellation and timeoutSeconds 1..3600")
 	}
-	if e.Effect != "read-only" {
-		return errors.New("MVP supports read-only effects only; no automatic retries")
+	if len(t.Binding.WebFetchDomains) > 0 && e.Permissions != PermissionWebRead {
+		return errors.New("webFetchDomains applies to web-read tools only")
+	}
+	seen := map[string]bool{}
+	for _, d := range t.Binding.WebFetchDomains {
+		if len(d) > 253 || !domainPattern.MatchString(d) || seen[d] {
+			return errors.New("webFetchDomains must be unique lower-case host names")
+		}
+		seen[d] = true
 	}
 	switch backend.Kind {
 	case "claude":
 		if len(t.OutputSchema) > MaxClaudeSchemaBytes {
 			return errors.New("Claude outputSchema exceeds the 64 KiB argument limit")
 		}
-		if e.Permissions != "no-tools" || e.Resources != "captured-context" || t.Binding.Extraction != "claude-structured-output" {
-			return errors.New("Claude requires no-tools, captured-context and claude-structured-output")
+		if t.Binding.Extraction != "claude-structured-output" {
+			return errors.New("Claude requires claude-structured-output")
+		}
+		switch {
+		case e.Permissions == PermissionNoTools && e.Effect == EffectReadOnly && e.Resources == ResourcesCaptured:
+		case e.Permissions == PermissionWebRead && e.Effect == EffectExternal && e.Resources == ResourcesWeb:
+		default:
+			return errors.New("Claude requires no-tools/read-only/captured-context or web-read/external-read/captured-context+web")
 		}
 	case "codex":
-		if !t.Binding.Experimental || e.Permissions != "read-only-sandbox" || e.Resources != "host-filesystem-readable" || t.Binding.Extraction != "codex-output-file" {
-			return errors.New("Codex requires experimental:true, read-only-sandbox, host-filesystem-readable and codex-output-file")
+		if e.Effect != EffectReadOnly || !t.Binding.Experimental || e.Permissions != "read-only-sandbox" || e.Resources != "host-filesystem-readable" || t.Binding.Extraction != "codex-output-file" {
+			return errors.New("Codex requires read-only, experimental:true, read-only-sandbox, host-filesystem-readable and codex-output-file")
 		}
 	}
 	return nil
