@@ -1,16 +1,112 @@
 # muster
 
-An experimental **Agent Proxy MCP** server. An operator registers named task
-contracts; a generic MCP client calls those tools with structured arguments.
-muster assembles the registered task and dispatches a fresh Claude or Codex CLI
-worker, validates its structured output, and records execution evidence.
+**Agree on the work. Define the request. Delegate through MCP.**
+
+muster is an experimental **Agent Proxy MCP** server that owns the agreement
+between a caller and an agent worker: **what work can be delegated, how to ask
+for it, and what must come back.**
+
+## Why muster?
+
+You want another agent to research a question. Before it can help, someone has
+to specify the task: which sources it may use, what counts as evidence, how to
+report uncertainty, and what shape the result should take. The caller needs to
+know how to ask. The worker needs a request it can understand and act on.
+Those expectations need a home that both sides can rely on.
+
+muster puts them in a registered task contract. An operator defines the task's
+name, description, input and output schemas, worker instructions, context, and
+execution binding. Callers add muster as an MCP server and discover the work
+available through `tools/list`. They invoke a named task with structured
+arguments; muster assembles the request the worker receives from that contract.
+
+For example, the included `research-brief` contract defines research over
+registered local sources. A caller sends:
+
+```json
+{
+  "name": "research-brief",
+  "arguments": {
+    "question": "What cancellation guarantees does muster provide?"
+  }
+}
+```
+
+The worker receives the registered research instructions, that question, the
+captured sources, and the required result schema. It knows to return a summary,
+source-backed evidence, and uncertainties. The caller knows which fields to
+expect. muster validates the output and returns the result or an explicit
+failure, with execution evidence attached.
+
+The research instructions are registered once. Each caller supplies the question.
+Each fresh worker receives the task in the same defined form.
+
+## A shared contract for both sides
+
+This is **dependency inversion for delegation**: the caller and the worker
+backend depend on a delegation contract owned by muster. That contract is the
+shared point of agreement.
+
+- **The caller can expect:** discoverable tasks, a defined request format, and
+  a declared result format. It can delegate without authoring a worker prompt
+  or knowing the CLI invocation.
+- **The worker can expect:** a request assembled from registered instructions,
+  validated arguments, an output schema, and the configured context. It can
+  perform the task without understanding each caller's internal representation
+  or implementing an MCP server.
+- **muster is responsible for:** keeping those expectations aligned, exposing
+  the public tool contract, constructing the worker request, and enforcing the
+  supported execution and result contracts.
+
+An orchestrator can use this boundary to decide what to delegate and how to use
+the result. A worker backend can evolve behind it as long as it can fulfill the
+registered contract. Any ordinary MCP client can use the same tasks; muster is
+independent of Vessel and Subsea.
+
+Worker pools, CLI adapters, cancellation, result validation, and evidence
+recording support that agreement in execution. Today, muster dispatches fresh
+Claude or Codex CLI workers. Schema validation checks the result's structure;
+the caller still evaluates its substance and decides what to do next.
+
+## Configure one instance around one role
+
+Start with a service you want to provide: "I need a group of workers that does
+this kind of work, exposes these tools, and can handle this many jobs at once."
+Configure a muster instance around that role. Its manifest defines the tool
+catalog, task instructions, context, backend bindings, execution permissions,
+and shared pool capacity before the server starts.
+
+For example, a research service could expose a small set of research tools
+with two worker slots and a queue of four. A code review service could have its
+own registered review tools, instructions, and capacity in a separate muster
+instance. These are examples of service boundaries an operator can configure;
+the role is expressed through the manifest's contracts and bindings.
+
+**Each instance is a deliberately scoped service, not a global registry of
+every agent and capability.** Clients connect to the MCP services whose roles
+they need. Needing a new capability does not mean attaching another arbitrary
+agent or adding unrelated tools to a running instance. The operator chooses
+whether it belongs to an existing role or warrants a separate service, then
+configures that service explicitly.
+
+The catalog is fixed at startup. Changing it requires a restart and explicit
+rediscovery by clients. Job inputs and worker execution vary within that
+configured boundary. In the current implementation, the worker group is a pool
+of execution slots shared by the instance's tools; each dispatched job starts
+a fresh CLI worker session.
+
+This makes the agreement useful to both sides: callers can discover a focused
+set of tasks, and workers receive requests prepared for the role they were
+configured to fulfill.
+
+## Implementation status
 
 This implements the generic MVP proposed in [issue #1](https://github.com/on-the-ground/muster/issues/1).
 The manifest and `muster/evidence` record below are **versioned implementation
-proposals**, not a final registration API or a Subsea language contract. Go was
-selected to reuse the official MCP Go SDK v1.8.0 used by Vessel while keeping
-this server independent of Vessel and Subsea. Native CLI workers avoid building
-another general agent framework.
+proposals**, not a final registration API or a Subsea language contract. See
+[the manifest contract](docs/manifest.md) for registration details. Go was
+selected to reuse the official MCP Go SDK v1.8.0 used by Vessel. Native CLI
+workers provide agent execution behind the registered contracts.
 
 ## Build and test
 
