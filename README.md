@@ -68,6 +68,37 @@ recording support that agreement in execution. Today, muster dispatches fresh
 Claude or Codex CLI workers. Schema validation checks the result's structure;
 the caller still evaluates its substance and decides what to do next.
 
+## Configure one instance around one role
+
+Start with a service you want to provide: "I need a group of workers that does
+this kind of work, exposes these tools, and can handle this many jobs at once."
+Configure a muster instance around that role. Its manifest defines the tool
+catalog, task instructions, context, backend bindings, execution permissions,
+and shared pool capacity before the server starts.
+
+For example, a research service could expose a small set of research tools
+with two worker slots and a queue of four. A code review service could have its
+own registered review tools, instructions, and capacity in a separate muster
+instance. These are examples of service boundaries an operator can configure;
+the role is expressed through the manifest's contracts and bindings.
+
+**Each instance is a deliberately scoped service, not a global registry of
+every agent and capability.** Clients connect to the MCP services whose roles
+they need. Needing a new capability does not mean attaching another arbitrary
+agent or adding unrelated tools to a running instance. The operator chooses
+whether it belongs to an existing role or warrants a separate service, then
+configures that service explicitly.
+
+The catalog is fixed at startup. Changing it requires a restart and explicit
+rediscovery by clients. Job inputs and worker execution vary within that
+configured boundary. In the current implementation, the worker group is a pool
+of execution slots shared by the instance's tools; each dispatched job starts
+a fresh CLI worker session.
+
+This makes the agreement useful to both sides: callers can discover a focused
+set of tasks, and workers receive requests prepared for the role they were
+configured to fulfill.
+
 ## Implementation status
 
 This implements the generic MVP proposed in [issue #1](https://github.com/on-the-ground/muster/issues/1).
