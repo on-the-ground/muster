@@ -207,3 +207,17 @@ func TestCancelledWebReadKeepsRequestedEffect(t *testing.T) {
 		t.Fatalf("effect %+v", out.Effects)
 	}
 }
+
+// Review of #4: past the effect limit the audit is incomplete, so the worker
+// is stopped at once and the outcome says so, instead of running on with
+// unrecorded requests.
+func TestEffectLimitStopsTheWorkerAndMarksTheAuditIncomplete(t *testing.T) {
+	start := time.Now()
+	out, err := startWeb(t, fixture(t), "flood", 30*time.Second)
+	if !errors.Is(err, ErrAuditLimit) || !out.CancelRequested || !out.Terminated || time.Since(start) > 10*time.Second {
+		t.Fatalf("not stopped at the audit limit: %+v %v", out.CancelReason, err)
+	}
+	if !out.AuditIncomplete || len(out.Effects) != maxEffects || out.CancelReason != "audit-limit" {
+		t.Fatalf("audit %v, %d effects, reason %q", out.AuditIncomplete, len(out.Effects), out.CancelReason)
+	}
+}

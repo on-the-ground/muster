@@ -67,6 +67,7 @@ type Evidence struct {
 	Status             string            `json:"status"`
 	Effect             string            `json:"effect"`
 	Effects            []worker.Effect   `json:"effects,omitempty"`
+	AuditIncomplete    bool              `json:"auditIncomplete,omitempty"`
 	DeniedTools        []string          `json:"deniedTools,omitempty"`
 }
 
@@ -212,6 +213,12 @@ func (p *Proxy) Call(ctx context.Context, name string, args json.RawMessage, met
 		}
 		return Result{Evidence: e, Error: code, Message: detail}
 	}
+	// Close waits for every call it lets in until that call's terminal
+	// evidence is written, whether it is refused, queued or dispatched.
+	if !p.enter() {
+		return finish("shutting_down", nil)
+	}
+	defer p.wg.Done()
 	// A terminal-only record is sufficient for requests refused before admission.
 	correlation, err := p.correlate(meta)
 	if err != nil {
@@ -282,9 +289,8 @@ func (p *Proxy) Call(ctx context.Context, name string, args json.RawMessage, met
 		return finish("shutting_down", nil)
 	}
 	p.active[id] = cancel
-	p.wg.Add(1)
 	p.mu.Unlock()
-	defer func() { p.mu.Lock(); delete(p.active, id); p.mu.Unlock(); p.wg.Done() }()
+	defer func() { p.mu.Lock(); delete(p.active, id); p.mu.Unlock() }()
 	request := worker.Request{Prompt: prompt, Schema: t.Definition.OutputSchema}
 	if t.Definition.Execution.Permissions == contract.PermissionWebRead {
 		request.Web = &worker.WebAccess{FetchDomains: t.Definition.Binding.WebFetchDomains}
@@ -306,13 +312,13 @@ func (p *Proxy) Call(ctx context.Context, name string, args json.RawMessage, met
 	if err := p.journal.Append(e); err != nil {
 		_ = proc.Cancel()
 		out, _ := proc.Wait()
-		e.WorkerTerminated, e.CancelRequested, e.Effects = out.Terminated, out.CancelRequested, out.Effects
+		e.WorkerTerminated, e.CancelRequested, e.Effects, e.AuditIncomplete = out.Terminated, out.CancelRequested, out.Effects, out.AuditIncomplete
 		return finish("evidence_failure", nil)
 	}
 	out, waitErr := proc.Wait()
 	e.WorkerStarted, e.WorkerTerminated, e.CancelRequested, e.SessionID = out.Started, out.Terminated, out.CancelRequested, out.SessionID
 	e.ParentExited = out.ParentExited
-	e.Effects, e.DeniedTools = out.Effects, out.DeniedTools
+	e.Effects, e.DeniedTools, e.AuditIncomplete = out.Effects, out.DeniedTools, out.AuditIncomplete
 	if errors.Is(waitErr, worker.ErrWaitDelay) {
 		e.FailureKind = "worker_io_timeout"
 	}
@@ -323,6 +329,9 @@ func (p *Proxy) Call(ctx context.Context, name string, args json.RawMessage, met
 	}
 	if errors.Is(waitErr, worker.ErrPolicy) {
 		return finish("permission_violation", nil)
+	}
+	if errors.Is(waitErr, worker.ErrAuditLimit) {
+		return finish("audit_limit_exceeded", nil)
 	}
 	if out.CancelReason == "timeout" {
 		return finish("timeout", nil)
@@ -428,6 +437,20 @@ func (p *Proxy) release() {
 	p.running--
 }
 
+// enter registers a call with the shutdown wait, unless shutdown has begun.
+func (p *Proxy) enter() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closing {
+		return false
+	}
+	p.wg.Add(1)
+	return true
+}
+
+// Close refuses new calls, ends queued calls without dispatch, cancels running
+// workers, and returns once every call it let in has written its terminal
+// evidence. The journal owner may close the journal after it returns.
 func (p *Proxy) Close() {
 	p.mu.Lock()
 	p.closing = true

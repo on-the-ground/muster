@@ -34,6 +34,11 @@ type Effect struct {
 // declared permissions. The job is stopped when it is observed.
 var ErrPolicy = errors.New("worker used a tool outside its declared permissions")
 
+// ErrAuditLimit reports that the worker requested more tool uses than one
+// job's evidence records. The job is stopped when the first unrecorded use is
+// observed, and its effect audit is incomplete.
+var ErrAuditLimit = errors.New("worker exceeded the effect audit limit")
+
 const (
 	maxTarget       = 2048
 	maxObservedURLs = 50
@@ -52,7 +57,7 @@ var urlPattern = regexp.MustCompile(`https?://[^\s"'<>\\)\]]+`)
 type streamParser struct {
 	mu        sync.Mutex
 	allowed   map[string]bool
-	onPolicy  func()
+	onStop    func(reason string)
 	partial   []byte
 	effects   []Effect
 	byID      map[string]int
@@ -60,16 +65,19 @@ type streamParser struct {
 	result    map[string]json.RawMessage
 	denied    []string
 	violation bool
+	overflow  bool
 	malformed bool
 	now       func() time.Time
 }
 
-func newStreamParser(tools []string, onPolicy func()) *streamParser {
+// onStop is called once, with "policy" or "audit-limit", when the job must be
+// stopped.
+func newStreamParser(tools []string, onStop func(reason string)) *streamParser {
 	allowed := map[string]bool{structuredOutputTool: true}
 	for _, t := range tools {
 		allowed[t] = true
 	}
-	return &streamParser{allowed: allowed, onPolicy: onPolicy, byID: map[string]int{}, now: func() time.Time { return time.Now().UTC() }}
+	return &streamParser{allowed: allowed, onStop: onStop, byID: map[string]int{}, now: func() time.Time { return time.Now().UTC() }}
 }
 
 func (s *streamParser) Write(data []byte) (int, error) {
@@ -170,7 +178,12 @@ func (s *streamParser) block(raw json.RawMessage) {
 			return
 		}
 		if len(s.effects) >= maxEffects {
-			s.malformed = true
+			// This use cannot be recorded: stop the job rather than let
+			// unaudited requests continue.
+			if !s.overflow {
+				s.overflow = true
+				s.stop("audit-limit")
+			}
 			return
 		}
 		e := Effect{Tool: b.Name, InputHash: contract.Hash(b.Input), RequestedAt: s.now(), Status: "requested"}
@@ -220,10 +233,23 @@ func (s *streamParser) block(raw json.RawMessage) {
 func (s *streamParser) violate() {
 	if !s.violation {
 		s.violation = true
-		if s.onPolicy != nil {
-			go s.onPolicy()
-		}
+		s.stop("policy")
 	}
+}
+
+// stop asks for the job to end. It runs outside the parser lock because
+// cancellation takes the process lock.
+func (s *streamParser) stop(reason string) {
+	if s.onStop != nil {
+		go s.onStop(reason)
+	}
+}
+
+// auditIncomplete reports whether tool uses went unrecorded.
+func (s *streamParser) auditIncomplete() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.overflow
 }
 
 // outcome returns the extracted structured output and evidence. Effects are
@@ -236,6 +262,8 @@ func (s *streamParser) outcome() (json.RawMessage, string, []Effect, []string, e
 	switch {
 	case s.violation:
 		return nil, s.session, effects, denied, ErrPolicy
+	case s.overflow:
+		return nil, s.session, effects, denied, ErrAuditLimit
 	case s.malformed || s.result == nil:
 		return nil, s.session, effects, denied, ErrOutput
 	}

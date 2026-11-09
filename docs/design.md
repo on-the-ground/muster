@@ -50,7 +50,9 @@ process; every job still gets a fresh session.
 
 Evidence version 2 records `job-admitted` (with any correlation values and the
 queue position, 0 for an immediate slot), `job-dispatched`, then
-`job-finished`. Calls refused before admission (input or correlation errors,
+`job-finished`. Shutdown refuses new calls, ends queued calls without
+dispatch, cancels running workers, and returns only after every call it let in
+has written its terminal record, so the journal can be closed safely after it. Calls refused before admission (input or correlation errors,
 `overloaded`, `shutting_down`) have a terminal-only record. The journal is
 serialized and synced before worker dispatch; failure to record evidence
 prevents dispatch or success. A short write, I/O or sync failure latches the
@@ -76,6 +78,7 @@ its own call record to the muster job even when no result ever returns.
 | `effect_uncertain` | Parent exit or full process-group termination could not be confirmed, or output pipes outlived the parent. `failureKind:worker_io_timeout` distinguishes an `ErrWaitDelay`. |
 | `evidence_failure` | Required evidence could not be persisted; no successful result is returned. |
 | `permission_violation` | The worker exposed or used a tool outside its declared permissions; the job was stopped when observed. |
+| `audit_limit_exceeded` | The worker requested more tool uses than one job's evidence records (256); the job was stopped at the first unrecorded use and `auditIncomplete` is set. |
 | `invalid_correlation` | A configured `_meta` key held a value that cannot be recorded; refused before admission. |
 | `overloaded` | Every slot busy and the queue full; refused before admission. No worker ran. |
 | `cancelled_before_dispatch` | Cancelled while queued (or between admission and dispatch). No worker ran, so no effect happened. |
@@ -141,6 +144,10 @@ evidence need:
 - A use still `requested` when the job ends (cancellation, timeout) may have
   reached the remote service; the entry is kept for that reason.
 - Native refusals are listed in `deniedTools` and mark their effect `denied`.
+- One job records at most 256 tool uses. The first use beyond that cannot be
+  audited, so the job is stopped at once, ends `audit_limit_exceeded`, and its
+  evidence carries `auditIncomplete:true`: the recorded effects are not all the
+  requests the worker made.
 
 Queries and URLs are recorded in clear so external requests can be audited.
 They can contain sensitive terms from the arguments; the evidence file is

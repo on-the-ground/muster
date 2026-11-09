@@ -141,7 +141,8 @@ its raw value.
   servers are disabled by CLI flags. **web-read**: only `WebSearch` and
   `WebFetch` exist, `dontAsk` refuses uses the allow rules do not cover, and an
   undeclared tool in the session or in a tool use stops the job
-  (`permission_violation`). In both, `--safe-mode`, empty settings sources, disabled
+  (`permission_violation`). A job records at most 256 tool uses; one more stops
+  it (`audit_limit_exceeded`, `auditIncomplete:true`). In both, `--safe-mode`, empty settings sources, disabled
   hooks/skills and forced memory controls exclude inherited CLAUDE.md and auto
   memory while retaining native authentication, and MCP servers stay disabled. Admin-managed policy still
   applies. This is not an OS sandbox around the Claude CLI itself.

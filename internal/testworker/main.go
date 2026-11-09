@@ -181,6 +181,14 @@ func stream(args []string, mode string, arguments json.RawMessage) {
 		use("f1", "WebFetch", map[string]any{"url": "https://blocked.example/", "prompt": "read"})
 		result("f1", "permission denied", true)
 		denials = append(denials, map[string]any{"tool_name": "WebFetch", "tool_use_id": "f1"})
+	case "flood":
+		// More tool uses than the audit holds, then keep running.
+		for i := 0; i < 300; i++ {
+			id := fmt.Sprintf("s%d", i)
+			use(id, "WebSearch", map[string]any{"query": id})
+			result(id, "Links: []", false)
+		}
+		time.Sleep(time.Hour)
 	case "rogue-tool":
 		use("b1", "Bash", map[string]any{"command": "true"})
 		time.Sleep(time.Hour)

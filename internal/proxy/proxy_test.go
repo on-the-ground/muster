@@ -463,3 +463,80 @@ func waitFor(t *testing.T, ok func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// blockingWriter holds its first write until released, like a slow disk.
+type blockingWriter struct {
+	syncWriter
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingWriter) Write(p []byte) (int, error) {
+	first := false
+	b.once.Do(func() { first = true })
+	if first {
+		close(b.entered)
+		<-b.release
+	}
+	return b.syncWriter.Write(p)
+}
+
+// Review of #4: Close must wait for every admitted call to write its
+// terminal evidence, not only for dispatched ones.
+func TestCloseWaitsForAdmittedCallsToFinishTheirEvidence(t *testing.T) {
+	log := &blockingWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	c := catalog(t)
+	p, err := New(c, map[string]worker.Backend{"test": newGated()}, NewJournal(log))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan Result, 1)
+	go func() { result <- p.Call(context.Background(), "echo", json.RawMessage(`{"n":1}`), nil) }()
+	<-log.entered // job-admitted is being written
+	closed := make(chan struct{})
+	go func() { p.Close(); close(closed) }()
+	select {
+	case <-closed:
+		t.Fatal("Close returned while an admitted call was still recording")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(log.release)
+	<-closed
+	select {
+	case r := <-result:
+		if r.Error != "shutting_down" {
+			t.Fatalf("admitted call at shutdown: %+v", r)
+		}
+	default:
+		t.Fatal("Close returned before the admitted call finished")
+	}
+	var kinds []string
+	for _, e := range events(&log.syncWriter) {
+		kinds = append(kinds, e.Event+"/"+e.Status)
+	}
+	if strings.Join(kinds, ",") != "job-admitted/running,job-finished/shutting_down" {
+		t.Fatalf("evidence %v", kinds)
+	}
+}
+
+// The same for a call waiting in the queue when Close is called.
+func TestCloseWaitsForQueuedCallsToFinishTheirEvidence(t *testing.T) {
+	b := newGated()
+	p, log := pooled(t, 1, 1, b)
+	running := call(p, context.Background(), 1, nil)
+	<-b.started
+	queued := call(p, context.Background(), 2, nil)
+	waitFor(t, func() bool { return count(log, "job-admitted", "queued") == 1 })
+	p.Close()
+	for _, r := range []chan Result{running, queued} {
+		select {
+		case <-r:
+		default:
+			t.Fatal("Close returned before an admitted call finished")
+		}
+	}
+	if count(log, "job-finished", "shutting_down") != 1 || count(log, "job-finished", "cancelled") != 1 {
+		t.Fatalf("terminal evidence missing: %+v", events(log))
+	}
+}

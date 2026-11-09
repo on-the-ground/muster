@@ -39,7 +39,7 @@ func launchConfigured(ctx context.Context, binary string, args []string, dir str
 	p.cmd.Stdin = bytes.NewReader(prompt)
 	p.cmd.Stdout, p.cmd.Stderr = &p.stdout, &p.stderr
 	if kind == "claude-stream" {
-		p.stream = newStreamParser(tools, func() { _ = p.cancel("policy") })
+		p.stream = newStreamParser(tools, func(reason string) { _ = p.cancel(reason) })
 		p.cmd.Stdout = p.stream
 	}
 	p.cmd.WaitDelay = 2 * time.Second
@@ -114,12 +114,13 @@ func (p *process) run(ctx context.Context) {
 	p.out.SessionID = session
 	if p.stream != nil {
 		_, _, p.out.Effects, p.out.DeniedTools, _ = p.stream.outcome()
+		p.out.AuditIncomplete = p.stream.auditIncomplete()
 	}
 	switch {
 	case pipeDelay:
 		p.err = ErrWaitDelay
-	case errors.Is(parseErr, ErrPolicy):
-		// The job was stopped for using an undeclared tool; report that first.
+	case errors.Is(parseErr, ErrPolicy), errors.Is(parseErr, ErrAuditLimit):
+		// The job was stopped for this reason; report it first.
 		p.err = parseErr
 	case observeErr != nil || waitErr != nil || killErr != nil:
 		p.err = errors.New("worker exit or process-group cleanup failed")

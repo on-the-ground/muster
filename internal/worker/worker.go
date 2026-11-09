@@ -38,8 +38,10 @@ type Outcome struct {
 	Started, ParentExited, Terminated, CancelRequested bool
 	CancelReason                                       string
 	// Effects and DeniedTools are observed native tool uses (web-read only).
-	Effects     []Effect
-	DeniedTools []string
+	// AuditIncomplete means more tool uses were requested than Effects holds.
+	Effects         []Effect
+	DeniedTools     []string
+	AuditIncomplete bool
 }
 type Process interface {
 	Cancel() error

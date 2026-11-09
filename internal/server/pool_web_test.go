@@ -187,3 +187,34 @@ func TestQueuedCallCancelledOverMCPNeverStarts(t *testing.T) {
 	stopRun()
 	<-running
 }
+
+// Review of #4: a worker that requests more tool uses than one job records is
+// stopped, and the call ends audit_limit_exceeded with an incomplete audit.
+func TestEffectAuditLimitOverMCP(t *testing.T) {
+	server, worker := binaries(t)
+	path, evidence := webManifest(t, worker)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	session, err := mcp.NewClient(&mcp.Implementation{Name: "audit-client", Version: "1"}, nil).Connect(ctx, &mcp.CommandTransport{Command: exec.Command(server, "-manifest", path, "-evidence", evidence)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	r, err := session.CallTool(ctx, &mcp.CallToolParams{Meta: mcp.Meta{"subsea/callRef": "flood"}, Name: "research", Arguments: json.RawMessage(`{"n":1,"mode":"flood"}`)})
+	if err != nil || !r.IsError {
+		t.Fatalf("flood was served: %v %+v", err, r)
+	}
+	var last struct {
+		Status          string            `json:"status"`
+		AuditIncomplete bool              `json:"auditIncomplete"`
+		CancelRequested bool              `json:"cancelRequested"`
+		Effects         []json.RawMessage `json:"effects"`
+	}
+	b, _ := json.Marshal(r.Meta["muster/evidence"])
+	if err := json.Unmarshal(b, &last); err != nil {
+		t.Fatal(err)
+	}
+	if last.Status != "audit_limit_exceeded" || !last.AuditIncomplete || !last.CancelRequested || len(last.Effects) != 256 {
+		t.Fatalf("audit limit evidence: status %s incomplete %v cancel %v effects %d", last.Status, last.AuditIncomplete, last.CancelRequested, len(last.Effects))
+	}
+}
